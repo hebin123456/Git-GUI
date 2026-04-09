@@ -1,0 +1,8 @@
+node_modules/
+dist/
+dist-electron/
+dist-git-mm/
+release/
+
+# npm run build:all 汇总产物
+build-all/

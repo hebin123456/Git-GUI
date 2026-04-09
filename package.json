@@ -1,0 +1,63 @@
+{
+  "name": "git-fork-like",
+  "version": "0.1.0",
+  "description": "Git desktop client (Electron + Vue 3 + TypeScript) — inspired workflow, not a Fork clone",
+  "main": "dist-electron/index.js",
+  "author": "",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vue-tsc --noEmit && vite build && electron-builder",
+    "build:git-mm": "vue-tsc --noEmit && vite build --mode git-mm-only && electron-builder",
+    "build:no-git-mm": "vue-tsc --noEmit && vite build --mode no-git-mm && electron-builder",
+    "preview": "vite preview",
+    "typecheck": "vue-tsc --noEmit",
+    "test": "tsx --test src/utils/clonePathUtils.spec.ts src/utils/stashSidebarSelection.spec.ts src/utils/forkCommitGraphLayout.spec.ts src/utils/diffLineRangePatch.spec.ts src/utils/partialLineMerge.spec.ts tests/functional/git-workflows.functional.spec.ts",
+    "test:unit": "tsx --test src/utils/clonePathUtils.spec.ts src/utils/stashSidebarSelection.spec.ts src/utils/forkCommitGraphLayout.spec.ts src/utils/diffLineRangePatch.spec.ts src/utils/partialLineMerge.spec.ts",
+    "test:functional": "tsx --test tests/functional/git-workflows.functional.spec.ts"
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.1",
+    "@tanstack/vue-virtual": "^3.13.23",
+    "diff2html": "^3.4.56",
+    "element-plus": "^2.9.6",
+    "simple-git": "^3.27.0",
+    "vue": "^3.5.13",
+    "vue-i18n": "^9.14.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "electron": "^33.2.1",
+    "electron-builder": "^25.1.8",
+    "tsx": "^4.21.0",
+    "typescript": "~5.6.3",
+    "vite": "^6.0.3",
+    "vite-plugin-electron": "^0.28.8",
+    "vue-tsc": "^2.1.10"
+  },
+  "build": {
+    "appId": "com.example.gitforklike",
+    "productName": "GitForkLike",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "dist",
+      "dist-electron"
+    ],
+    "icon": "icon.png",
+    "extraResources": [
+      {
+        "from": "build/icon.png",
+        "to": "icon.png"
+      }
+    ],
+    "win": {
+      "target": "dir",
+      "icon": "icon.png"
+    }
+  }
+}
