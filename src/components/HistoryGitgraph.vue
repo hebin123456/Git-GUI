@@ -98,6 +98,70 @@ function isCurrentBranchRef(ref: string): boolean {
   return ref === props.currentBranch
 }
 
+type GraphRefSlice = {
+  visible: string[]
+  hidden: string[]
+}
+
+const HISTORY_GRAPH_INLINE_REF_LIMIT = 4
+const HISTORY_GRAPH_INLINE_REF_BUDGET_PX = 318
+const HISTORY_GRAPH_INLINE_REF_GAP_PX = 6
+const HISTORY_GRAPH_INLINE_REF_MIN_PX = 42
+const HISTORY_GRAPH_INLINE_REF_MAX_PX = 156
+const HISTORY_GRAPH_INLINE_REF_CHAR_PX = 6.6
+const HISTORY_GRAPH_INLINE_REF_BASE_PX = 24
+const HISTORY_GRAPH_INLINE_REF_CHECK_PX = 14
+const HISTORY_GRAPH_INLINE_MORE_PX = 30
+
+function estimateGraphRefPillWidth(ref: string): number {
+  const label = refLabel(ref)
+  const width = Math.ceil(
+    label.length * HISTORY_GRAPH_INLINE_REF_CHAR_PX +
+      HISTORY_GRAPH_INLINE_REF_BASE_PX +
+      (isCurrentBranchRef(ref) ? HISTORY_GRAPH_INLINE_REF_CHECK_PX : 0)
+  )
+  return Math.min(HISTORY_GRAPH_INLINE_REF_MAX_PX, Math.max(HISTORY_GRAPH_INLINE_REF_MIN_PX, width))
+}
+
+function estimateGraphRefMoreWidth(hiddenCount: number): number {
+  return HISTORY_GRAPH_INLINE_MORE_PX + String(hiddenCount).length * 8
+}
+
+function estimateGraphRefSliceWidth(visible: string[], hiddenCount: number): number {
+  if (!visible.length && !hiddenCount) return 0
+  let total = 0
+  for (const ref of visible) total += estimateGraphRefPillWidth(ref)
+  total += Math.max(0, visible.length - 1) * HISTORY_GRAPH_INLINE_REF_GAP_PX
+  if (hiddenCount > 0) {
+    total += (visible.length ? HISTORY_GRAPH_INLINE_REF_GAP_PX : 0) + estimateGraphRefMoreWidth(hiddenCount)
+  }
+  return total
+}
+
+function splitGraphRefsInline(refs: string[]): GraphRefSlice {
+  if (!refs.length) return { visible: [], hidden: [] }
+
+  let visibleCount = Math.min(HISTORY_GRAPH_INLINE_REF_LIMIT, refs.length)
+  while (visibleCount > 1) {
+    const hiddenCount = refs.length - visibleCount
+    if (estimateGraphRefSliceWidth(refs.slice(0, visibleCount), hiddenCount) <= HISTORY_GRAPH_INLINE_REF_BUDGET_PX) {
+      break
+    }
+    visibleCount -= 1
+  }
+
+  return {
+    visible: refs.slice(0, visibleCount),
+    hidden: refs.slice(visibleCount)
+  }
+}
+
+const graphRefSlices = computed<GraphRefSlice[]>(() => props.rows.map((row) => splitGraphRefsInline(row.refs ?? [])))
+
+function graphRefListTitle(refs: string[]): string {
+  return refs.map((ref) => refLabel(ref)).join(', ')
+}
+
 function onRowClick(hash: string) {
   emit('select', hash)
 }
@@ -190,9 +254,9 @@ function onGraphCommand(cmd: string, hash: string) {
               <div class="history-graph-row-cells">
               <div class="history-graph-col-msg">
                 <div class="history-graph-msg-line">
-                  <div v-if="rows[v.index]!.refs.length" class="history-graph-refs-inline">
+                  <div v-if="graphRefSlices[v.index]?.visible.length" class="history-graph-refs-inline">
                     <span
-                      v-for="ref in rows[v.index]!.refs"
+                      v-for="ref in graphRefSlices[v.index]!.visible"
                       :key="ref"
                       class="ref-pill"
                       :class="{
@@ -200,12 +264,23 @@ function onGraphCommand(cmd: string, hash: string) {
                         'ref-pill-remote': refPillKind(ref) === 'remote',
                         'ref-pill-branch': refPillKind(ref) === 'branch'
                       }"
+                      :title="refLabel(ref)"
                     >
                       <el-icon v-if="isCurrentBranchRef(ref)" class="ref-pill-check" :size="12">
                         <Check />
                       </el-icon>
                       {{ refLabel(ref) }}
                     </span>
+                    <el-tooltip
+                      v-if="graphRefSlices[v.index]!.hidden.length"
+                      effect="dark"
+                      placement="top"
+                      :content="graphRefListTitle(graphRefSlices[v.index]!.hidden)"
+                    >
+                      <span class="ref-pill ref-pill-more">
+                        +{{ graphRefSlices[v.index]!.hidden.length }}
+                      </span>
+                    </el-tooltip>
                   </div>
                   <div
                     class="history-graph-subject-line"

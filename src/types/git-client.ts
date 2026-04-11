@@ -68,6 +68,18 @@ export type DiffOpts = {
 
 export type GitErr = { error: string }
 
+export type GitConfigScope = 'global' | 'local'
+
+export type GitConfigEntry = {
+  key: string
+  value: string
+}
+
+export type GitConfigSetEntry = {
+  key: string
+  value?: string | null
+}
+
 export type FetchOpts = string | { remote?: string; all?: boolean; prune?: boolean }
 
 export type PullOpts = {
@@ -117,6 +129,7 @@ export interface GitMmClientApi {
   execInteractive: (opts: { cwd: string; args: string[] }) => Promise<
     { code: number; stdout: string; stderr: string } | GitErr
   >
+  onOutput: (handler: (payload: { stream: 'stdout' | 'stderr'; text: string }) => void) => () => void
   onPrompt: (handler: (payload: { id: string; promptText: string }) => void) => () => void
   answerPrompt: (id: string, line: string) => void
   listSubrepos: (root: string, maxDepth?: number) => Promise<{ paths: string[] } | GitErr>
@@ -127,7 +140,7 @@ export interface GitMmClientApi {
 export interface GitAtClientApi {
   status: (root: string) => Promise<GitStatusPlain | GitErr>
   stage: (root: string, paths: string[]) => Promise<{ ok: true } | GitErr>
-  unstage: (root: string, paths: string[]) => Promise<{ ok: true } | GitErr>
+  unstage: (root: string, paths: string[], opts?: { amend?: boolean }) => Promise<{ ok: true } | GitErr>
   commit: (
     root: string,
     payload: { subject: string; body?: string; amend?: boolean }
@@ -186,6 +199,18 @@ export interface GitClientApi {
   selectDirectory: () => Promise<string | null>
   /** 选择可执行文件（设置中的终端 / 合并工具路径） */
   selectExecutable: () => Promise<string | null>
+  /** 选择补丁文件并读取文本内容（Repository > Apply Patch） */
+  selectPatchFile: (opts?: { title?: string }) => Promise<{ path: string; text: string } | null | GitErr>
+  /** 主进程托管的稳定 key-value 存储；同步读取以支持首屏设置恢复 */
+  appStorageGet: (key: string) => string | null
+  appStorageSet: (key: string, value: string) => void
+  appStorageRemove: (key: string) => void
+  /** 另存为文本文件；取消时返回 `{ ok:false, canceled:true }` */
+  saveTextFile: (opts: {
+    title?: string
+    defaultPath?: string
+    text: string
+  }) => Promise<{ ok: true; path: string } | { ok: false; canceled: true } | GitErr>
   cloneRepo: (opts: { url: string; directory: string }) => Promise<{ path: string } | GitErr>
   setRepo: (p: string) => Promise<{ ok: true } | { ok: false; error: string }>
   /** 将主进程仓库切到该路径、聚焦主窗口并触发主界面同步（Git MM 子仓 → 主窗口变更） */
@@ -194,6 +219,8 @@ export interface GitClientApi {
   onExternalRepoSet: (handler: (path: string) => void) => () => void
   clearRepo: () => Promise<{ ok: true }>
   getRoot: () => Promise<string | null>
+  gitConfigGetMany: (opts: { scope: GitConfigScope; keys: string[] }) => Promise<{ entries: GitConfigEntry[] } | GitErr>
+  gitConfigSetMany: (opts: { scope: GitConfigScope; entries: GitConfigSetEntry[] }) => Promise<{ ok: true } | GitErr>
   status: () => Promise<GitStatusPlain | GitErr>
   stage: (paths: string[]) => Promise<{ ok: true } | GitErr>
   unstage: (paths: string[], opts?: { amend?: boolean }) => Promise<{ ok: true } | GitErr>
@@ -299,6 +326,11 @@ export interface GitClientApi {
   commitDetail: (hash: string) => Promise<CommitDetail | GitErr>
   /** 提交树快照中的全部文件路径（`git ls-tree -r --name-only`） */
   commitTreePaths: (hash: string) => Promise<{ paths: string[] } | GitErr>
+  exportCommitArchive: (opts: {
+    hash: string
+    title?: string
+    defaultPath?: string
+  }) => Promise<{ ok: true; path: string } | { ok: false; canceled: true } | GitErr>
   commitDiff: (hash: string, opts: DiffOpts, filePath: string) => Promise<string | GitErr>
   blame: (relPath: string) => Promise<{ text: string } | GitErr>
   logFile: (opts: { path: string; maxCount?: number }) => Promise<

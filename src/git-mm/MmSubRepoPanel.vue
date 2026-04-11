@@ -4,7 +4,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { html as diff2htmlHtml } from 'diff2html'
 import { ColorSchemeType } from 'diff2html/lib/types'
 import 'diff2html/bundles/css/diff2html.min.css'
-import { computed, nextTick, onMounted, onUnmounted, provide, ref, toRef, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, provide, ref, toRef, watch, type Ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { CommitDetail, LogEntry } from '../types/git-client.ts'
 import ChangesView from '../components/ChangesView.vue'
@@ -17,6 +17,7 @@ import { onThemeEffectiveChange } from '../utils/appTheme.ts'
 import { isBinaryDiffOutput } from '../utils/binaryDiffDetect.ts'
 import { bindDiff2HtmlSideLayoutAndScroll } from '../utils/diff2HtmlSideScrollSync.ts'
 import MmDiffOptionsToolbar from './MmDiffOptionsToolbar.vue'
+import ResizableSplit from '../components/common/ResizableSplit.vue'
 
 const props = defineProps<{ repoPath: string }>()
 
@@ -126,6 +127,30 @@ const stashUntracked = ref(false)
 const stashOnlyPaths = ref(false)
 const stashPathsPick = ref<string[]>([])
 const stashBusy = ref(false)
+const panelActionBusyDepth = ref(0)
+const panelActionBusyText = ref('')
+
+function beginPanelActionBusy(text: string): () => void {
+  panelActionBusyDepth.value += 1
+  const prev = panelActionBusyText.value
+  panelActionBusyText.value = text || t('common.loading')
+  let done = false
+  return () => {
+    if (done) return
+    done = true
+    panelActionBusyDepth.value = Math.max(0, panelActionBusyDepth.value - 1)
+    panelActionBusyText.value = panelActionBusyDepth.value > 0 ? prev : ''
+  }
+}
+
+async function runPanelActionBusy<T>(text: string, task: () => Promise<T>): Promise<T> {
+  const end = beginPanelActionBusy(text)
+  try {
+    return await task()
+  } finally {
+    end()
+  }
+}
 
 const status = computed(() => mmWs.status.value)
 
@@ -191,39 +216,47 @@ async function refreshAll() {
 }
 
 async function onCheckout(br: string) {
-  const r = await at.checkout(props.repoPath, br)
-  if ('error' in r) ElMessage.error(r.error)
-  else {
-    ElMessage.success(t('gitMm.checkoutOk'))
-    await refreshAll()
-  }
+  await runPanelActionBusy(t('ws.loadingCheckout', { branch: br }), async () => {
+    const r = await at.checkout(props.repoPath, br)
+    if ('error' in r) ElMessage.error(r.error)
+    else {
+      ElMessage.success(t('gitMm.checkoutOk'))
+      await refreshAll()
+    }
+  })
 }
 
 async function doFetch() {
-  const r = await at.fetch(props.repoPath)
-  if ('error' in r) ElMessage.error(r.error)
-  else {
-    ElMessage.success(t('gitMm.fetchOk'))
-    await refreshAll()
-  }
+  await runPanelActionBusy(t('ws.loadingFetch'), async () => {
+    const r = await at.fetch(props.repoPath)
+    if ('error' in r) ElMessage.error(r.error)
+    else {
+      ElMessage.success(t('gitMm.fetchOk'))
+      await refreshAll()
+    }
+  })
 }
 
 async function doPull() {
-  const r = await at.pull(props.repoPath)
-  if ('error' in r) ElMessage.error(r.error)
-  else {
-    ElMessage.success(t('gitMm.pullOk'))
-    await refreshAll()
-  }
+  await runPanelActionBusy(t('ws.loadingPull'), async () => {
+    const r = await at.pull(props.repoPath)
+    if ('error' in r) ElMessage.error(r.error)
+    else {
+      ElMessage.success(t('gitMm.pullOk'))
+      await refreshAll()
+    }
+  })
 }
 
 async function doPush() {
-  const r = await at.push(props.repoPath)
-  if ('error' in r) ElMessage.error(r.error)
-  else {
-    ElMessage.success(t('gitMm.pushOk'))
-    await refreshAll()
-  }
+  await runPanelActionBusy(t('ws.loadingPush'), async () => {
+    const r = await at.push(props.repoPath)
+    if ('error' in r) ElMessage.error(r.error)
+    else {
+      ElMessage.success(t('gitMm.pushOk'))
+      await refreshAll()
+    }
+  })
 }
 
 async function doStashPush(opts: {
@@ -233,20 +266,25 @@ async function doStashPush(opts: {
   paths?: string[]
 }) {
   stashBusy.value = true
-  const r = await at.stashPush(props.repoPath, opts)
-  stashBusy.value = false
-  if ('error' in r) {
-    if (isStashNothingError(r.error)) {
-      ElMessage.info(r.error)
-      return
-    }
-    ElMessage.error(r.error)
-    return
+  try {
+    await runPanelActionBusy(t('ws.loadingStashSave'), async () => {
+      const r = await at.stashPush(props.repoPath, opts)
+      if ('error' in r) {
+        if (isStashNothingError(r.error)) {
+          ElMessage.info(r.error)
+          return
+        }
+        ElMessage.error(r.error)
+        return
+      }
+      ElMessage.success(t('changes.stashSaved'))
+      stashDialogOpen.value = false
+      await refreshStashList()
+      await mmWs.refreshAll()
+    })
+  } finally {
+    stashBusy.value = false
   }
-  ElMessage.success(t('changes.stashSaved'))
-  stashDialogOpen.value = false
-  await refreshStashList()
-  await mmWs.refreshAll()
 }
 
 async function onStashSaveSubmit() {
@@ -270,14 +308,16 @@ async function onStashSaveSubmit() {
 }
 
 async function onStashApply(ix: number) {
-  const r = await at.stashApply(props.repoPath, ix)
-  if ('error' in r) {
-    ElMessage.error(r.error)
-    return
-  }
-  ElMessage.success(t('ws.stashApplied'))
-  await refreshStashList()
-  await mmWs.refreshAll()
+  await runPanelActionBusy(t('ws.loadingStashApply'), async () => {
+    const r = await at.stashApply(props.repoPath, ix)
+    if ('error' in r) {
+      ElMessage.error(r.error)
+      return
+    }
+    ElMessage.success(t('ws.stashApplied'))
+    await refreshStashList()
+    await mmWs.refreshAll()
+  })
 }
 
 async function onStashPop(ix: number) {
@@ -290,14 +330,16 @@ async function onStashPop(ix: number) {
   } catch {
     return
   }
-  const r = await at.stashPop(props.repoPath, ix)
-  if ('error' in r) {
-    ElMessage.error(r.error)
-    return
-  }
-  ElMessage.success(t('ws.stashPopped'))
-  await refreshStashList()
-  await mmWs.refreshAll()
+  await runPanelActionBusy(t('ws.loadingStashPop'), async () => {
+    const r = await at.stashPop(props.repoPath, ix)
+    if ('error' in r) {
+      ElMessage.error(r.error)
+      return
+    }
+    ElMessage.success(t('ws.stashPopped'))
+    await refreshStashList()
+    await mmWs.refreshAll()
+  })
 }
 
 async function onStashDrop(ix: number) {
@@ -316,13 +358,15 @@ async function onStashDrop(ix: number) {
   } catch {
     return
   }
-  const r = await at.stashDrop(props.repoPath, ix)
-  if ('error' in r) {
-    ElMessage.error(r.error)
-    return
-  }
-  ElMessage.success(t('ws.stashDropped'))
-  await refreshStashList()
+  await runPanelActionBusy(t('ws.loadingStashDrop'), async () => {
+    const r = await at.stashDrop(props.repoPath, ix)
+    if ('error' in r) {
+      ElMessage.error(r.error)
+      return
+    }
+    ElMessage.success(t('ws.stashDropped'))
+    await refreshStashList()
+  })
 }
 
 function onStashMenuCommand(ix: number, cmd: string | number) {
@@ -410,6 +454,36 @@ watch(innerTab, (v) => {
 })
 
 let offThemeEffective: (() => void) | undefined
+let foregroundRefreshTimer: ReturnType<typeof setTimeout> | null = null
+
+function scheduleForegroundRefresh() {
+  if (!props.repoPath) return
+  if (
+    statusLoading.value ||
+    historyLoading.value ||
+    detailLoading.value ||
+    histDiffLoading.value ||
+    panelActionBusyDepth.value > 0 ||
+    workspaceActionBusy.value
+  ) {
+    return
+  }
+  if (foregroundRefreshTimer) clearTimeout(foregroundRefreshTimer)
+  foregroundRefreshTimer = setTimeout(() => {
+    foregroundRefreshTimer = null
+    void refreshAll()
+  }, 400)
+}
+
+function onWindowFocus() {
+  if (document.visibilityState !== 'visible') return
+  scheduleForegroundRefresh()
+}
+
+function onVisibilityChange() {
+  if (document.visibilityState !== 'visible') return
+  scheduleForegroundRefresh()
+}
 
 onMounted(() => {
   initHistDiffOptsFromSettings()
@@ -417,10 +491,18 @@ onMounted(() => {
   offThemeEffective = onThemeEffectiveChange(() => {
     histDiffSurfaceDark.value = document.documentElement.classList.contains('dark')
   })
+  window.addEventListener('focus', onWindowFocus)
+  document.addEventListener('visibilitychange', onVisibilityChange)
   void nextTick(() => rebindHistDiffSideScroll())
 })
 
 onUnmounted(() => {
+  window.removeEventListener('focus', onWindowFocus)
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+  if (foregroundRefreshTimer) {
+    clearTimeout(foregroundRefreshTimer)
+    foregroundRefreshTimer = null
+  }
   offThemeEffective?.()
   mmHistDiffSideCleanup?.()
   mmHistDiffSideCleanup = null
@@ -429,170 +511,230 @@ onUnmounted(() => {
 const statusLoading = computed(
   () => (mmWs as unknown as { statusLoading: import('vue').Ref<boolean> }).statusLoading.value
 )
+const workspaceActionBusy = computed(
+  () => (mmWs as unknown as { actionBusy: Ref<boolean> }).actionBusy?.value ?? false
+)
+const workspaceActionBusyText = computed(
+  () => (mmWs as unknown as { actionBusyText: Ref<string> }).actionBusyText?.value ?? ''
+)
 
-const panelBusy = computed(() => statusLoading.value || historyLoading.value)
+const panelBusy = computed(
+  () => statusLoading.value || historyLoading.value || panelActionBusyDepth.value > 0 || workspaceActionBusy.value
+)
+const panelBusyText = computed(() => {
+  if (panelActionBusyDepth.value > 0 && panelActionBusyText.value) return panelActionBusyText.value
+  if (workspaceActionBusy.value && workspaceActionBusyText.value) return workspaceActionBusyText.value
+  return t('common.loading')
+})
 </script>
 
 <template>
-  <div v-loading="panelBusy" class="mm-sub-root">
-    <div class="mm-sub-toolbar">
-      <el-select
-        :model-value="currentBranch"
-        filterable
-        size="small"
-        class="mm-branch-select"
-        :placeholder="t('gitMm.branch')"
-        @update:model-value="(v: string) => onCheckout(v)"
-      >
-        <el-option v-for="b in branches" :key="b" :label="b" :value="b" />
-      </el-select>
-      <el-button size="small" @click="refreshAll">
-        <el-icon class="el-icon--left"><Refresh /></el-icon>
-        {{ t('gitMm.refreshRepo') }}
-      </el-button>
-      <el-button size="small" @click="doFetch">{{ t('ribbon.fetch') }}</el-button>
-      <el-button size="small" @click="doPull">
-        <el-icon class="el-icon--left"><Bottom /></el-icon>
-        {{ t('ribbon.pull') }}
-      </el-button>
-      <el-button size="small" @click="doPush">
-        <el-icon class="el-icon--left"><Top /></el-icon>
-        {{ t('ribbon.push') }}
-      </el-button>
-      <el-text v-if="status" size="small" type="info" class="mm-sync-hint">
-        ↑{{ status.ahead }} ↓{{ status.behind }}
-      </el-text>
+  <div v-loading.lock="panelBusy" :element-loading-text="panelBusyText" class="mm-sub-root">
+    <div class="mm-sub-toolbar fork-header-wrap">
+      <div class="mm-sub-toolbar-main fork-toolbar">
+        <div class="tb-tools mm-sub-toolbar-actions">
+          <el-select
+            :model-value="currentBranch"
+            filterable
+            size="small"
+            class="mm-branch-select"
+            :placeholder="t('gitMm.branch')"
+            @update:model-value="(v: string) => onCheckout(v)"
+          >
+            <el-option v-for="b in branches" :key="b" :label="b" :value="b" />
+          </el-select>
+          <el-button size="small" @click="refreshAll">
+            <el-icon class="el-icon--left"><Refresh /></el-icon>
+            {{ t('gitMm.refreshRepo') }}
+          </el-button>
+          <el-button size="small" @click="doFetch">{{ t('ribbon.fetch') }}</el-button>
+          <el-button size="small" @click="doPull">
+            <el-icon class="el-icon--left"><Bottom /></el-icon>
+            {{ t('ribbon.pull') }}
+          </el-button>
+          <el-button size="small" @click="doPush">
+            <el-icon class="el-icon--left"><Top /></el-icon>
+            {{ t('ribbon.push') }}
+          </el-button>
+        </div>
+        <div class="tb-center tb-center-compact mm-sub-toolbar-path">
+          <el-text truncated type="info" size="small" class="repo-path-hint" :title="repoPath">
+            {{ repoPath }}
+          </el-text>
+        </div>
+        <div class="tb-right">
+          <el-text v-if="status" size="small" type="info" class="mm-sync-hint">
+            ↑{{ status.ahead }} ↓{{ status.behind }}
+          </el-text>
+        </div>
+      </div>
     </div>
 
     <el-tabs v-model="innerTab" class="mm-inner-tabs">
       <el-tab-pane :label="t('changes.unstaged') + ' / ' + t('changes.staged')" name="changes">
         <div class="mm-changes-embed">
-          <ChangesView :git-at-hunk-root="repoPath" class="mm-changes-view" />
-          <div class="mm-stash-bar">
-            <div class="mm-stash-head">
-              <span class="mm-file-head">{{ t('ribbon.stash') }}</span>
-              <el-button size="small" class="mm-stash-save-btn" :loading="stashBusy" @click="stashDialogOpen = true">
-                {{ t('syncUi.stashSaveBtn') }}
-              </el-button>
-            </div>
-            <el-scrollbar class="mm-stash-scroll">
-              <div v-for="row in stashEntries" :key="row.index" class="mm-stash-row">
-                <span class="mono mm-stash-idx">#{{ row.index }}</span>
-                <span class="mm-stash-label" :title="row.label">{{ row.label }}</span>
-                <el-dropdown trigger="click" @command="(cmd: string | number) => onStashMenuCommand(row.index, cmd)">
-                  <el-button size="small" text class="mm-stash-more" :aria-label="t('ribbon.stashMore')">
-                    <el-icon><MoreFilled /></el-icon>
+          <ResizableSplit
+            class="mm-changes-split"
+            direction="vertical"
+            storage-key="fork-layout-mm-changes"
+            :default-primary-percent="78"
+            :min-primary-percent="42"
+            :max-primary-percent="92"
+          >
+            <template #top>
+              <ChangesView :git-at-hunk-root="repoPath" class="mm-changes-view" />
+            </template>
+            <template #bottom>
+              <div class="mm-stash-bar">
+                <div class="mm-stash-head">
+                  <span class="mm-file-head">{{ t('ribbon.stash') }}</span>
+                  <el-button size="small" class="mm-stash-save-btn" :loading="stashBusy" @click="stashDialogOpen = true">
+                    {{ t('syncUi.stashSaveBtn') }}
                   </el-button>
-                  <template #dropdown>
-                    <el-dropdown-menu>
-                      <el-dropdown-item command="apply">{{ t('sidebar.applyStash') }}</el-dropdown-item>
-                      <el-dropdown-item command="pop">{{ t('sidebar.popStash') }}</el-dropdown-item>
-                      <el-dropdown-item divided command="drop">{{ t('sidebar.dropStash') }}</el-dropdown-item>
-                    </el-dropdown-menu>
-                  </template>
-                </el-dropdown>
+                </div>
+                <el-scrollbar class="mm-stash-scroll">
+                  <div v-for="row in stashEntries" :key="row.index" class="mm-stash-row">
+                    <span class="mono mm-stash-idx">#{{ row.index }}</span>
+                    <span class="mm-stash-label" :title="row.label">{{ row.label }}</span>
+                    <el-dropdown trigger="click" @command="(cmd: string | number) => onStashMenuCommand(row.index, cmd)">
+                      <el-button size="small" text class="mm-stash-more" :aria-label="t('ribbon.stashMore')">
+                        <el-icon><MoreFilled /></el-icon>
+                      </el-button>
+                      <template #dropdown>
+                        <el-dropdown-menu>
+                          <el-dropdown-item command="apply">{{ t('sidebar.applyStash') }}</el-dropdown-item>
+                          <el-dropdown-item command="pop">{{ t('sidebar.popStash') }}</el-dropdown-item>
+                          <el-dropdown-item divided command="drop">{{ t('sidebar.dropStash') }}</el-dropdown-item>
+                        </el-dropdown-menu>
+                      </template>
+                    </el-dropdown>
+                  </div>
+                  <div v-if="!stashEntries.length" class="mm-muted mm-stash-empty">{{ t('sidebar.noStash') }}</div>
+                </el-scrollbar>
               </div>
-              <div v-if="!stashEntries.length" class="mm-muted mm-stash-empty">{{ t('sidebar.noStash') }}</div>
-            </el-scrollbar>
-          </div>
+            </template>
+          </ResizableSplit>
         </div>
       </el-tab-pane>
       <el-tab-pane :label="t('sidebar.navHistory')" name="history">
-        <div class="mm-hist-split">
-          <el-table
-            v-loading="historyLoading"
-            :data="historyEntries"
-            size="small"
-            height="280"
-            highlight-current-row
-            class="mm-hist-table"
-            @row-click="(row: LogEntry) => openDetail(row.hash)"
-          >
-            <el-table-column prop="hash" :label="t('gitMm.colHash')" width="108">
-              <template #default="{ row }">
-                <span class="mono">{{ row.hash.slice(0, 7) }}</span>
-              </template>
-            </el-table-column>
-            <el-table-column prop="message" :label="t('gitMm.colSubject')" min-width="160" show-overflow-tooltip />
-            <el-table-column prop="author_name" :label="t('gitMm.colAuthor')" width="100" show-overflow-tooltip />
-            <el-table-column prop="date" :label="t('gitMm.colDate')" width="148" show-overflow-tooltip />
-          </el-table>
-          <div class="mm-detail">
-            <template v-if="detailLoading">
-              <el-text size="small">{{ t('common.loading') }}</el-text>
-            </template>
-            <template v-else-if="detail">
-              <div class="mm-detail-head mono">{{ detail.fullHash.slice(0, 12) }}</div>
-              <div class="mm-detail-subj">{{ detail.subject }}</div>
-              <div class="mm-detail-meta muted">{{ detail.authorName }} · {{ detail.date }}</div>
-              <div class="mm-detail-files">
-                <div class="mm-file-head">{{ t('gitMm.changedFiles') }}</div>
-                <el-scrollbar class="mm-file-scroll mm-detail-file-scroll">
-                  <button
-                    v-for="f in detail.files"
-                    :key="f.path"
-                    type="button"
-                    class="mm-file-row"
-                    @click="loadFileDiffInDetail(f.path)"
-                  >
-                    <span class="mono mm-status">{{ f.status }}</span> {{ f.path }}
-                  </button>
-                </el-scrollbar>
-              </div>
-              <div class="mm-detail-diff mm-diff-panel">
-                <div v-if="!detailDiffPath" class="mm-diff-placeholder">{{ t('gitMm.pickFileFromCommit') }}</div>
-                <template v-else>
-                  <div class="mm-diff-toolbar-row">
-                    <MmDiffOptionsToolbar
-                      :diff-output-format="histDiffOutputFormat"
-                      :diff-ignore-blank-lines="histDiffIgnoreBlankLines"
-                      :diff-ignore-whitespace="histDiffIgnoreWhitespace"
-                      :diff-context-lines="histDiffContextLines"
-                      :diff-show-full-file="histDiffShowFullFile"
-                      :context-disabled="!detailDiffPath || histDiffShowFullFile"
-                      @toggle-diff-format="toggleHistDiffFormat"
-                      @toggle-ignore-blank-lines="toggleHistIgnoreBlankLines"
-                      @toggle-ignore-whitespace="toggleHistIgnoreWhitespace"
-                      @dec-context-lines="decHistContextLines"
-                      @inc-context-lines="incHistContextLines"
-                      @toggle-show-full-file="toggleHistShowFullFile"
-                    />
-                    <el-tag size="small" effect="plain" type="info" class="mm-diff-scope-tag mono">
-                      {{ detail.fullHash.slice(0, 7) }}
-                    </el-tag>
-                    <el-text v-if="histDiffLoading" type="info" size="small">{{ t('common.loading') }}</el-text>
-                  </div>
-                  <el-scrollbar ref="mmDetailDiffScrollbarRef" class="mm-diff-changes-scroll mm-detail-diff-scroll">
-                    <div v-if="histDiffLoading" class="mm-diff-placeholder">{{ t('common.loading') }}</div>
-                    <template v-else>
-                      <div v-if="histDiffText === EMPTY_DIFF_SENTINEL" class="mm-diff-placeholder">{{
-                        t('changes.noDiff')
-                      }}</div>
-                      <div v-else-if="histDiffIsBinary" class="change-binary-preview">
-                        <el-icon class="change-binary-ico" :size="56"><Document /></el-icon>
-                        <div v-if="fileExtension(detailDiffPath)" class="change-binary-ext">{{
-                          fileExtension(detailDiffPath)
-                        }}</div>
-                        <div class="change-binary-size muted">{{ t('changes.binaryNoSize') }}</div>
-                        <div class="mm-binary-hint muted">{{ t('changes.binaryNoLineOps') }}</div>
-                      </div>
-                      <div
-                        v-else-if="histDiffHtml"
-                        class="change-diff2html-host"
-                        @contextmenu.prevent="(e) => onDiff2HtmlContextMenu(e, histDiffText)"
-                      >
-                        <div ref="mmDiff2htmlDetailRef" class="diff2html-root" v-html="histDiffHtml" />
-                      </div>
-                      <pre v-else-if="histDiffText" class="mm-diff-pre mono">{{ histDiffText }}</pre>
-                      <div v-else class="mm-diff-placeholder">{{ t('changes.noContent') }}</div>
-                    </template>
-                  </el-scrollbar>
+        <ResizableSplit
+          class="mm-hist-split"
+          storage-key="fork-layout-mm-history"
+          :default-primary-percent="38"
+          :min-primary-percent="20"
+          :max-primary-percent="60"
+        >
+          <template #left>
+            <el-table
+              v-loading="historyLoading"
+              :data="historyEntries"
+              size="small"
+              height="100%"
+              highlight-current-row
+              class="mm-hist-table"
+              @row-click="(row: LogEntry) => openDetail(row.hash)"
+            >
+              <el-table-column prop="hash" :label="t('gitMm.colHash')" width="108">
+                <template #default="{ row }">
+                  <span class="mono">{{ row.hash.slice(0, 7) }}</span>
                 </template>
-              </div>
-            </template>
-            <el-text v-else type="info" size="small">{{ t('gitMm.pickCommit') }}</el-text>
-          </div>
-        </div>
+              </el-table-column>
+              <el-table-column prop="message" :label="t('gitMm.colSubject')" min-width="160" show-overflow-tooltip />
+              <el-table-column prop="author_name" :label="t('gitMm.colAuthor')" width="100" show-overflow-tooltip />
+              <el-table-column prop="date" :label="t('gitMm.colDate')" width="148" show-overflow-tooltip />
+            </el-table>
+          </template>
+          <template #right>
+            <div class="mm-detail">
+              <template v-if="detailLoading">
+                <el-text size="small">{{ t('common.loading') }}</el-text>
+              </template>
+              <template v-else-if="detail">
+                <div class="mm-detail-head mono">{{ detail.fullHash.slice(0, 12) }}</div>
+                <div class="mm-detail-subj">{{ detail.subject }}</div>
+                <div class="mm-detail-meta muted">{{ detail.authorName }} · {{ detail.date }}</div>
+                <ResizableSplit
+                  class="mm-detail-body-split"
+                  direction="vertical"
+                  storage-key="fork-layout-mm-history-detail"
+                  :default-primary-percent="32"
+                  :min-primary-percent="18"
+                  :max-primary-percent="72"
+                >
+                  <template #top>
+                    <div class="mm-detail-files">
+                      <div class="mm-file-head">{{ t('gitMm.changedFiles') }}</div>
+                      <el-scrollbar class="mm-file-scroll mm-detail-file-scroll">
+                        <button
+                          v-for="f in detail.files"
+                          :key="f.path"
+                          type="button"
+                          class="mm-file-row"
+                          @click="loadFileDiffInDetail(f.path)"
+                        >
+                          <span class="mono mm-status">{{ f.status }}</span> {{ f.path }}
+                        </button>
+                      </el-scrollbar>
+                    </div>
+                  </template>
+                  <template #bottom>
+                    <div class="mm-detail-diff mm-diff-panel">
+                      <div v-if="!detailDiffPath" class="mm-diff-placeholder">{{ t('gitMm.pickFileFromCommit') }}</div>
+                      <template v-else>
+                        <div class="mm-diff-toolbar-row">
+                          <MmDiffOptionsToolbar
+                            :diff-output-format="histDiffOutputFormat"
+                            :diff-ignore-blank-lines="histDiffIgnoreBlankLines"
+                            :diff-ignore-whitespace="histDiffIgnoreWhitespace"
+                            :diff-context-lines="histDiffContextLines"
+                            :diff-show-full-file="histDiffShowFullFile"
+                            :context-disabled="!detailDiffPath || histDiffShowFullFile"
+                            @toggle-diff-format="toggleHistDiffFormat"
+                            @toggle-ignore-blank-lines="toggleHistIgnoreBlankLines"
+                            @toggle-ignore-whitespace="toggleHistIgnoreWhitespace"
+                            @dec-context-lines="decHistContextLines"
+                            @inc-context-lines="incHistContextLines"
+                            @toggle-show-full-file="toggleHistShowFullFile"
+                          />
+                          <el-tag size="small" effect="plain" type="info" class="mm-diff-scope-tag mono">
+                            {{ detail.fullHash.slice(0, 7) }}
+                          </el-tag>
+                          <el-text v-if="histDiffLoading" type="info" size="small">{{ t('common.loading') }}</el-text>
+                        </div>
+                        <el-scrollbar ref="mmDetailDiffScrollbarRef" class="mm-diff-changes-scroll mm-detail-diff-scroll">
+                          <div v-if="histDiffLoading" class="mm-diff-placeholder">{{ t('common.loading') }}</div>
+                          <template v-else>
+                            <div v-if="histDiffText === EMPTY_DIFF_SENTINEL" class="mm-diff-placeholder">{{
+                              t('changes.noDiff')
+                            }}</div>
+                            <div v-else-if="histDiffIsBinary" class="change-binary-preview">
+                              <el-icon class="change-binary-ico" :size="56"><Document /></el-icon>
+                              <div v-if="fileExtension(detailDiffPath)" class="change-binary-ext">{{
+                                fileExtension(detailDiffPath)
+                              }}</div>
+                              <div class="change-binary-size muted">{{ t('changes.binaryNoSize') }}</div>
+                              <div class="mm-binary-hint muted">{{ t('changes.binaryNoLineOps') }}</div>
+                            </div>
+                            <div
+                              v-else-if="histDiffHtml"
+                              class="change-diff2html-host"
+                              @contextmenu.prevent="(e) => onDiff2HtmlContextMenu(e, histDiffText)"
+                            >
+                              <div ref="mmDiff2htmlDetailRef" class="diff2html-root" v-html="histDiffHtml" />
+                            </div>
+                            <pre v-else-if="histDiffText" class="mm-diff-pre mono">{{ histDiffText }}</pre>
+                            <div v-else class="mm-diff-placeholder">{{ t('changes.noContent') }}</div>
+                          </template>
+                        </el-scrollbar>
+                      </template>
+                    </div>
+                  </template>
+                </ResizableSplit>
+              </template>
+              <el-text v-else type="info" size="small">{{ t('gitMm.pickCommit') }}</el-text>
+            </div>
+          </template>
+        </ResizableSplit>
       </el-tab-pane>
     </el-tabs>
 
@@ -656,21 +798,30 @@ const panelBusy = computed(() => statusLoading.value || historyLoading.value)
   display: flex;
   flex-direction: column;
   height: 100%;
-  min-height: 360px;
+  min-height: 0;
   overflow: hidden;
 }
 .mm-sub-toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
   margin-bottom: 8px;
+}
+.mm-sub-toolbar-main {
+  gap: 10px;
+}
+.mm-sub-toolbar-actions {
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.mm-sub-toolbar-path {
+  min-width: 0;
+}
+.mm-sub-toolbar-path .repo-path-hint {
+  max-width: 100%;
 }
 .mm-branch-select {
   width: 200px;
 }
 .mm-sync-hint {
-  margin-left: 4px;
+  white-space: nowrap;
 }
 .mm-inner-tabs {
   flex: 1;
@@ -681,14 +832,23 @@ const panelBusy = computed(() => statusLoading.value || historyLoading.value)
 .mm-inner-tabs :deep(.el-tabs__content) {
   flex: 1;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
 }
-.mm-changes-embed {
+.mm-inner-tabs :deep(.el-tab-pane) {
+  flex: 1 1 0%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 10px;
-  min-height: 420px;
-  max-height: calc(100vh - 200px);
+}
+.mm-changes-embed {
+  flex: 1 1 0%;
+  min-height: 0;
+  display: flex;
+}
+.mm-changes-split {
+  flex: 1 1 0%;
+  min-height: 0;
+  width: 100%;
 }
 .mm-changes-view {
   flex: 1;
@@ -697,14 +857,15 @@ const panelBusy = computed(() => statusLoading.value || historyLoading.value)
   flex-direction: column;
 }
 .mm-stash-bar {
-  flex-shrink: 0;
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 6px;
   padding: 8px 10px;
-  max-height: 140px;
   display: flex;
   flex-direction: column;
   gap: 6px;
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
 }
 .mm-stash-head {
   display: flex;
@@ -713,7 +874,8 @@ const panelBusy = computed(() => statusLoading.value || historyLoading.value)
   gap: 8px;
 }
 .mm-stash-scroll {
-  max-height: 96px;
+  flex: 1 1 0%;
+  min-height: 0;
 }
 .mm-stash-row {
   display: flex;
@@ -737,20 +899,29 @@ const panelBusy = computed(() => statusLoading.value || historyLoading.value)
   font-size: 12px;
 }
 .mm-hist-split {
-  display: grid;
-  grid-template-columns: minmax(280px, 1fr) 1fr;
-  gap: 12px;
-  align-items: start;
-  min-height: 320px;
+  flex: 1 1 0%;
+  min-height: 0;
+  width: 100%;
 }
 .mm-hist-table {
   width: 100%;
+  height: 100%;
 }
 .mm-detail {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
   min-width: 0;
+  min-height: 0;
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 6px;
   padding: 10px 12px;
+  overflow: hidden;
+}
+.mm-detail-body-split {
+  flex: 1 1 0%;
+  min-height: 0;
+  width: 100%;
 }
 .mm-detail-head {
   font-size: 12px;
@@ -765,7 +936,11 @@ const panelBusy = computed(() => statusLoading.value || historyLoading.value)
   margin-bottom: 10px;
 }
 .mm-detail-files {
-  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  height: 100%;
+  margin-bottom: 0;
 }
 .mm-file-head {
   font-size: 12px;
@@ -773,7 +948,8 @@ const panelBusy = computed(() => statusLoading.value || historyLoading.value)
   margin-bottom: 6px;
 }
 .mm-file-scroll {
-  max-height: 120px;
+  flex: 1 1 0%;
+  min-height: 0;
 }
 .mm-file-row {
   display: block;
@@ -793,7 +969,10 @@ const panelBusy = computed(() => statusLoading.value || historyLoading.value)
   margin-right: 6px;
 }
 .mm-diff-panel {
-  min-height: 200px;
+  flex: 1 1 0%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 .mm-diff-toolbar-row {
   display: flex;
@@ -808,9 +987,12 @@ const panelBusy = computed(() => statusLoading.value || historyLoading.value)
   font-size: 13px;
 }
 .mm-diff-changes-scroll {
-  max-height: min(48vh, 420px);
+  flex: 1 1 0%;
+  min-height: 0;
 }
 .mm-detail-diff-scroll {
+  flex: 1 1 0%;
+  min-height: 0;
   border: 1px solid var(--el-border-color-lighter);
   border-radius: 6px;
 }

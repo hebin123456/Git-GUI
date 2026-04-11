@@ -48,6 +48,7 @@ import {
   type RepoWorkspaceSyncPayload
 } from '../constants/repoWorkspaceSync.ts'
 import { broadcastRepoWorkspaceChanged } from '../utils/repoWorkspaceBroadcast.ts'
+import { extractRecentCommitMessages } from '../utils/recentCommitMessages.ts'
 import { html as diff2htmlHtml } from 'diff2html'
 import { ColorSchemeType } from 'diff2html/lib/types'
 import 'diff2html/bundles/css/diff2html.min.css'
@@ -110,6 +111,7 @@ const historyGitgraph = ref<GitgraphImportRow[]>([])
 /** 提交搜索等临时覆盖提交图数据（为 null 时用全量 log） */
 const historyGraphOverride = ref<GitLogPayload | null>(null)
 const historySearchLoading = ref(false)
+const recentCommitMessages = computed(() => extractRecentCommitMessages(history.value, historyGitgraph.value))
 /** 设置中的「提交图单次加载条数」；启动后由 applyAppSettings 同步 */
 const persistedHistoryMaxCommits = ref(DEFAULT_APP_SETTINGS.historyMaxCommits)
 /** 本次会话内「加载更多」累加条数（刷新全部等不重置，换仓库会清零） */
@@ -207,7 +209,27 @@ function isLikelyNetworkOrRemoteError(msg: string): boolean {
   )
 }
 
+const GLOBAL_GIT_LOADING_WINDOW_CLASS = 'fork-git-loading-active'
+let globalGitLoadingWindowDepth = 0
+
+function beginGlobalGitLoadingWindowControls() {
+  if (typeof document === 'undefined') return
+  globalGitLoadingWindowDepth += 1
+  if (globalGitLoadingWindowDepth === 1) {
+    document.body.classList.add(GLOBAL_GIT_LOADING_WINDOW_CLASS)
+  }
+}
+
+function endGlobalGitLoadingWindowControls() {
+  if (typeof document === 'undefined') return
+  globalGitLoadingWindowDepth = Math.max(0, globalGitLoadingWindowDepth - 1)
+  if (globalGitLoadingWindowDepth === 0) {
+    document.body.classList.remove(GLOBAL_GIT_LOADING_WINDOW_CLASS)
+  }
+}
+
 function runWithGitLoading<T>(text: string, fn: () => Promise<T>): Promise<T> {
+  beginGlobalGitLoadingWindowControls()
   const loading = ElLoading.service({
     lock: true,
     text,
@@ -215,6 +237,7 @@ function runWithGitLoading<T>(text: string, fn: () => Promise<T>): Promise<T> {
   })
   return fn().finally(() => {
     loading.close()
+    endGlobalGitLoadingWindowControls()
   })
 }
 
@@ -349,26 +372,35 @@ function resetWorkspaceState() {
   detailTab.value = 'commit'
 }
 
-async function switchRepoToTab(tab: RepoTab): Promise<boolean> {
-  const set = await api.setRepo(tab.path)
-  if (!set.ok) {
-    loadError.value = set.error
-    return false
+async function switchRepoToTab(tab: RepoTab, opts?: { skipLoading?: boolean }): Promise<boolean> {
+  const run = async (): Promise<boolean> => {
+    const set = await api.setRepo(tab.path)
+    if (!set.ok) {
+      loadError.value = set.error
+      return false
+    }
+    activeTabId.value = tab.id
+    repoPath.value = tab.path
+    selectedRemote.value = tab.selectedRemote ?? ''
+    clearHistoryCommitDetail()
+    loadError.value = null
+    persistWorkspaceNow()
+    await refreshAll()
+    applySelectedRemoteForCurrentRepo(tab.selectedRemote)
+    return true
   }
-  activeTabId.value = tab.id
-  repoPath.value = tab.path
-  selectedRemote.value = tab.selectedRemote ?? ''
-  clearHistoryCommitDetail()
-  loadError.value = null
-  await refreshAll()
-  return true
+  if (opts?.skipLoading) return run()
+  return runWithGitLoading(
+    tr('ws.loadingOpenRepo', { name: (tab.title && String(tab.title).trim()) || basenameRepo(tab.path) }),
+    run
+  )
 }
 
-async function activateTab(id: string) {
+async function activateTab(id: string, opts?: { skipLoading?: boolean }) {
   const tab = repoTabs.value.find((t) => t.id === id)
   if (!tab) return
   if (id === activeTabId.value && repoPath.value === tab.path) return
-  await switchRepoToTab(tab)
+  await switchRepoToTab(tab, opts)
 }
 
 /** el-tabs 在切换前调用：setRepo 失败时阻止切换，避免界面与主进程仓库不一致 */
@@ -393,7 +425,10 @@ async function onTabRemove(name: string | number) {
   if (i === -1) return
   const wasActive = activeTabId.value === id
   repoTabs.value.splice(i, 1)
-  if (!wasActive) return
+  if (!wasActive) {
+    persistWorkspaceNow()
+    return
+  }
   if (repoTabs.value.length) {
     const next = repoTabs.value[Math.min(i, repoTabs.value.length - 1)]!
     await activateTab(next.id)
@@ -402,6 +437,7 @@ async function onTabRemove(name: string | number) {
     repoPath.value = null
     resetWorkspaceState()
     await api.clearRepo()
+    persistWorkspaceNow()
   }
 }
 
@@ -471,7 +507,7 @@ const repoTitle = computed(() => {
     const tab = repoTabs.value.find((t) => t.id === id)
     if (tab?.title) return tab.title
   }
-  if (!repoPath.value) return 'GitForkLike'
+  if (!repoPath.value) return 'git-gui'
   const p = repoPath.value.replace(/[/\\]+$/, '')
   const i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'))
   return i < 0 ? p : p.slice(i + 1)
@@ -585,6 +621,9 @@ function onMenuCommand(cmd: string) {
       break
     case 'repo:file-history':
       openFileHistoryDialog()
+      break
+    case 'repo:apply-patch':
+      void applyPatchFromFile()
       break
     case 'repo:rebase-interactive-start':
       openRebaseInteractiveStartDialog()
@@ -836,9 +875,33 @@ async function openPartialStashPushInTerminal() {
   ElMessage.success(tr('ws.terminalOpened'))
 }
 
+async function applyPatchFromFile() {
+  if (!repoPath.value) return
+  const picked = await api.selectPatchFile({ title: tr('ws.applyPatchPickTitle') })
+  if (!picked) return
+  if ('error' in picked) {
+    ElMessage.error(picked.error)
+    return
+  }
+  await runWithGitLoading(tr('ws.loadingApplyPatch'), async () => {
+    const r = await api.applyPatch(picked.text, { cached: false, reverse: false })
+    if ('error' in r) {
+      ElMessage.error(r.error)
+      return
+    }
+    ElMessage.success(tr('ws.applyPatchDone'))
+    await refreshAll()
+    if (repoPath.value) broadcastRepoWorkspaceChanged(repoPath.value, 'apply-patch', 'main')
+  })
+}
+
 async function openHostingCompareInBrowser() {
   if (!repoPath.value) return
-  const remote = selectedRemote.value.trim() || 'origin'
+  const remote = resolvePreferredRemoteName(selectedRemote.value)
+  if (!remote) {
+    ElMessage.warning(tr('ws.remoteUrlMissing'))
+    return
+  }
   const row = remoteDetails.value.find((r) => r.name === remote)
   const fetchUrl = row?.fetchUrl || row?.pushUrl
   if (!fetchUrl?.trim()) {
@@ -890,32 +953,39 @@ async function loadSidebarExtra() {
   if (!('error' in sm)) submoduleItems.value = sm.submodules
 }
 
-async function addOpenedRepo(picked: string): Promise<boolean> {
+async function addOpenedRepo(picked: string, opts?: { skipLoading?: boolean }): Promise<boolean> {
   const norm = normRepoPath(picked)
   const existing = repoTabs.value.find((t) => normRepoPath(t.path) === norm)
   if (existing) {
-    await activateTab(existing.id)
+    await activateTab(existing.id, opts)
     return true
   }
-  const set = await api.setRepo(picked)
-  if (!set.ok) {
-    loadError.value = set.error
-    return false
-  }
-  const id = newTabId()
   const title = repoDisplayNames.value[norm] ?? basenameRepo(picked)
-  repoTabs.value.push({ id, path: picked, title })
-  repoDisplayNames.value[norm] = title
-  activeTabId.value = id
-  repoPath.value = picked
-  loadError.value = null
-  clearHistoryCommitDetail()
-  historyLogExtra.value = 0
-  await loadStatus()
-  await loadHistory()
-  await loadRemotes()
-  await loadSidebarExtra()
-  return true
+  const run = async (): Promise<boolean> => {
+    const set = await api.setRepo(picked)
+    if (!set.ok) {
+      loadError.value = set.error
+      return false
+    }
+    const id = newTabId()
+    repoTabs.value.push({ id, path: picked, title })
+    repoDisplayNames.value[norm] = title
+    activeTabId.value = id
+    repoPath.value = picked
+    selectedRemote.value = ''
+    loadError.value = null
+    clearHistoryCommitDetail()
+    historyLogExtra.value = 0
+    persistWorkspaceNow()
+    await loadStatus()
+    await loadHistory()
+    await loadRemotes()
+    await loadSidebarExtra()
+    applySelectedRemoteForCurrentRepo()
+    return true
+  }
+  if (opts?.skipLoading) return run()
+  return runWithGitLoading(tr('ws.loadingOpenRepo', { name: title }), run)
 }
 
 async function openRepo() {
@@ -961,7 +1031,7 @@ async function runCloneRepo() {
     }
     ElMessage.success(tr('ws.cloneDone'))
     cloneDialogOpen.value = false
-    await addOpenedRepo(r.path)
+    await addOpenedRepo(r.path, { skipLoading: true })
   })
 }
 
@@ -1108,7 +1178,7 @@ async function refreshAll() {
 }
 
 function remoteArg(): string | undefined {
-  return selectedRemote.value || undefined
+  return preferredRemoteName.value || undefined
 }
 
 function openFetchSyncDialog() {
@@ -1903,12 +1973,7 @@ async function runRevertAbort() {
 }
 
 function defaultRemoteForTagDelete(): string {
-  const list = remotes.value
-  if (!list.length) return ''
-  const sr = selectedRemote.value.trim()
-  if (sr && list.includes(sr)) return sr
-  if (list.includes('origin')) return 'origin'
-  return list[0]!
+  return resolvePreferredRemoteName(selectedRemote.value)
 }
 
 function openTagDeleteDialog(tagName: string) {
@@ -3344,37 +3409,148 @@ async function unstageAllStaged() {
   clearStagedTreeSelection()
 }
 
-async function doCommit() {
-  const subj = commitSubject.value.trim()
-  if (!subj) {
+function validateCommitDraft():
+  | { subject: string; body?: string; wasAmend: boolean }
+  | null {
+  const subject = commitSubject.value.trim()
+  if (!subject) {
     ElMessage.warning(tr('ws.commitSubjectRequired'))
-    return
+    return null
   }
   if (!commitAmend.value && stagedRows.value.length === 0) {
     ElMessage.warning(tr('ws.nothingToCommit'))
-    return
+    return null
   }
-  commitBusy.value = true
-  loadError.value = null
-  const wasAmend = commitAmend.value
-  const r = await api.commit({
-    subject: subj,
+  return {
+    subject,
     body: commitDescription.value.trim() || undefined,
-    amend: wasAmend
-  })
-  commitBusy.value = false
-  if ('error' in r) {
-    ElMessage.error(r.error)
-    return
+    wasAmend: commitAmend.value
   }
+}
+
+function resetCommitComposerAfterSuccess() {
   commitFieldsBeforeAmend.value = null
   commitAmend.value = false
   amendHeadDetail.value = null
   commitSubject.value = ''
   commitDescription.value = ''
-  ElMessage.success(wasAmend ? tr('ws.commitAmended') : tr('ws.commitSucceeded'))
-  await refreshAll()
-  if (repoPath.value) broadcastRepoWorkspaceChanged(repoPath.value, 'commit', 'main')
+}
+
+function parseTrackingRef(tracking: string | null | undefined): { remote: string; branch: string } | null {
+  const raw = String(tracking ?? '').trim()
+  if (!raw) return null
+  const slash = raw.indexOf('/')
+  if (slash <= 0 || slash >= raw.length - 1) return null
+  return {
+    remote: raw.slice(0, slash).trim(),
+    branch: raw.slice(slash + 1).trim()
+  }
+}
+
+function resolvePreferredRemoteName(preferred?: string | null): string {
+  const names = remotes.value
+  const picked = String(preferred ?? '').trim()
+  if (picked && names.includes(picked)) return picked
+  const trackingRemote = parseTrackingRef(status.value?.tracking)?.remote ?? ''
+  if (trackingRemote && names.includes(trackingRemote)) return trackingRemote
+  const configured = loadAppSettings().gitDefaultRemoteName.trim()
+  if (configured && names.includes(configured)) return configured
+  if (names.includes('origin')) return 'origin'
+  return names[0] ?? ''
+}
+
+function applySelectedRemoteForCurrentRepo(preferred?: string | null) {
+  const next = resolvePreferredRemoteName(preferred)
+  if (selectedRemote.value === next) return
+  selectedRemote.value = next
+  persistWorkspaceNow()
+}
+
+const preferredRemoteName = computed(() => resolvePreferredRemoteName(selectedRemote.value))
+
+function buildCommitAndPushOpts(): PushOpts | undefined {
+  const selected = resolvePreferredRemoteName(selectedRemote.value)
+  const current = currentBranch.value.trim()
+  const tracking = parseTrackingRef(status.value?.tracking)
+  const trackingRemote = tracking?.remote ?? ''
+  const trackingBranch = tracking?.branch ?? ''
+  const remote = selected || trackingRemote || remotes.value[0] || ''
+  if (!remote) return undefined
+  if (!current || status.value?.detached) return { remote }
+  return {
+    remote,
+    localBranch: current,
+    remoteBranch:
+      trackingRemote === remote && trackingBranch && trackingBranch !== current ? trackingBranch : undefined,
+    setUpstream: !trackingRemote || (selected ? selected !== trackingRemote : false) || undefined
+  }
+}
+
+async function pushAfterCommit(): Promise<string | null> {
+  loadError.value = null
+  syncBusy.value = 'push'
+  try {
+    const opts = buildCommitAndPushOpts()
+    const r = opts ? await api.push(opts) : await api.push()
+    return 'error' in r ? r.error : null
+  } finally {
+    syncBusy.value = null
+  }
+}
+
+async function doCommit() {
+  const draft = validateCommitDraft()
+  if (!draft) return
+  commitBusy.value = true
+  try {
+    loadError.value = null
+    const r = await api.commit({
+      subject: draft.subject,
+      body: draft.body,
+      amend: draft.wasAmend
+    })
+    if ('error' in r) {
+      ElMessage.error(r.error)
+      return
+    }
+    resetCommitComposerAfterSuccess()
+    ElMessage.success(draft.wasAmend ? tr('ws.commitAmended') : tr('ws.commitSucceeded'))
+    await refreshAll()
+    if (repoPath.value) broadcastRepoWorkspaceChanged(repoPath.value, 'commit', 'main')
+  } finally {
+    commitBusy.value = false
+  }
+}
+
+async function doCommitAndPush() {
+  const draft = validateCommitDraft()
+  if (!draft) return
+  commitBusy.value = true
+  try {
+    loadError.value = null
+    const r = await api.commit({
+      subject: draft.subject,
+      body: draft.body,
+      amend: draft.wasAmend
+    })
+    if ('error' in r) {
+      ElMessage.error(r.error)
+      return
+    }
+    resetCommitComposerAfterSuccess()
+    const pushError = await pushAfterCommit()
+    await refreshAll()
+    if (repoPath.value) {
+      broadcastRepoWorkspaceChanged(repoPath.value, pushError ? 'commit' : 'commit-push', 'main')
+    }
+    if (pushError) {
+      ElMessage.error(tr('ws.commitSucceededPushFailed', { error: pushError }))
+      return
+    }
+    ElMessage.success(draft.wasAmend ? tr('ws.commitAndPushAmended') : tr('ws.commitAndPushSucceeded'))
+  } finally {
+    commitBusy.value = false
+  }
 }
 
 async function loadDiff() {
@@ -3465,6 +3641,9 @@ function persistAppSettings(s: PersistedAppSettingsV1) {
   if (n.historyMaxCommits !== prevMax) {
     historyLogExtra.value = 0
     if (repoPath.value) void loadHistory()
+  }
+  if (repoPath.value && !selectedRemote.value.trim()) {
+    applySelectedRemoteForCurrentRepo()
   }
   if (selectedPath.value) void loadDiff()
   if (selectedHistoryHash.value) void loadCommitDetailDiff()
@@ -3641,18 +3820,20 @@ watch(commitAmend, async (on) => {
       subject: commitSubject.value,
       description: commitDescription.value
     }
-    const seq = ++amendLoadSeq
-    const d = await api.commitDetail('HEAD')
-    if (seq !== amendLoadSeq) return
-    if ('error' in d) {
-      ElMessage.error(d.error)
-      commitFieldsBeforeAmend.value = null
-      commitAmend.value = false
-      return
-    }
-    amendHeadDetail.value = d
-    commitSubject.value = d.subject
-    commitDescription.value = d.body ?? ''
+    await runWithGitLoading(tr('ws.loadingAmendPrepare'), async () => {
+      const seq = ++amendLoadSeq
+      const d = await api.commitDetail('HEAD')
+      if (seq !== amendLoadSeq) return
+      if ('error' in d) {
+        ElMessage.error(d.error)
+        commitFieldsBeforeAmend.value = null
+        commitAmend.value = false
+        return
+      }
+      amendHeadDetail.value = d
+      commitSubject.value = d.subject
+      commitDescription.value = d.body ?? ''
+    })
   } else {
     amendLoadSeq += 1
     amendHeadDetail.value = null
@@ -3959,6 +4140,7 @@ export function useGitWorkspace() {
     commitDescription,
     commitOverviewCollapseName,
     commitSubject,
+    recentCommitMessages,
     currentBranch,
     decContextLines,
     detailTab,
@@ -3972,6 +4154,7 @@ export function useGitWorkspace() {
     diffShowFullFile,
     diffText,
     doCommit,
+    doCommitAndPush,
     stageAllUnstaged,
     fetchDialogOpen,
     pullDialogOpen,
@@ -4158,6 +4341,7 @@ export function useGitWorkspace() {
     selectedPath,
     selectedWorkingFileSize,
     selectedRemote,
+    preferredRemoteName,
     shortSha,
     sidebarSearch,
     sortedCommitDetailFiles,

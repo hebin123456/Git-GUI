@@ -11,6 +11,11 @@ contextBridge.exposeInMainWorld('gitMm', {
   exec: (opts: { cwd: string; args: string[] }) => ipcRenderer.invoke('git-mm:exec', opts),
   execInteractive: (opts: { cwd: string; args: string[] }) =>
     ipcRenderer.invoke('git-mm:exec-interactive', opts),
+  onOutput: (handler: (payload: { stream: 'stdout' | 'stderr'; text: string }) => void) => {
+    const fn = (_evt: unknown, payload: { stream: 'stdout' | 'stderr'; text: string }) => handler(payload)
+    ipcRenderer.on('git-mm:output', fn as (e: unknown, p: unknown) => void)
+    return () => ipcRenderer.removeListener('git-mm:output', fn as (e: unknown, p: unknown) => void)
+  },
   onPrompt: (handler: (payload: { id: string; promptText: string }) => void) => {
     const fn = (_evt: unknown, payload: { id: string; promptText: string }) => handler(payload)
     ipcRenderer.on('git-mm:prompt', fn as (e: unknown, p: unknown) => void)
@@ -25,7 +30,8 @@ contextBridge.exposeInMainWorld('gitMm', {
 contextBridge.exposeInMainWorld('gitAt', {
   status: (root: string) => ipcRenderer.invoke('git-at:status', root),
   stage: (root: string, paths: string[]) => ipcRenderer.invoke('git-at:stage', root, paths),
-  unstage: (root: string, paths: string[]) => ipcRenderer.invoke('git-at:unstage', root, paths),
+  unstage: (root: string, paths: string[], opts?: { amend?: boolean }) =>
+    ipcRenderer.invoke('git-at:unstage', root, paths, opts ?? {}),
   commit: (root: string, payload: { subject: string; body?: string; amend?: boolean }) =>
     ipcRenderer.invoke('git-at:commit', root, payload),
   branches: (root: string) => ipcRenderer.invoke('git-at:branches', root),
@@ -88,6 +94,16 @@ contextBridge.exposeInMainWorld('gitClient', {
   openRepoDialog: () => ipcRenderer.invoke('dialog:open-repo'),
   selectDirectory: () => ipcRenderer.invoke('dialog:select-directory'),
   selectExecutable: () => ipcRenderer.invoke('dialog:select-executable'),
+  selectPatchFile: (opts?: { title?: string }) => ipcRenderer.invoke('dialog:select-patch-file', opts ?? {}),
+  appStorageGet: (key: string) => ipcRenderer.sendSync('app-storage:get-sync', key) as string | null,
+  appStorageSet: (key: string, value: string) => {
+    ipcRenderer.sendSync('app-storage:set-sync', { key, value })
+  },
+  appStorageRemove: (key: string) => {
+    ipcRenderer.sendSync('app-storage:remove-sync', key)
+  },
+  saveTextFile: (opts: { title?: string; defaultPath?: string; text: string }) =>
+    ipcRenderer.invoke('dialog:save-text-file', opts),
   cloneRepo: (opts: { url: string; directory: string }) => ipcRenderer.invoke('git:clone', opts),
   setRepo: (p: string) => ipcRenderer.invoke('git:set-repo', p),
   focusMainWithRepo: (p: string) => ipcRenderer.invoke('window:focus-main-with-repo', p),
@@ -98,6 +114,10 @@ contextBridge.exposeInMainWorld('gitClient', {
   },
   clearRepo: () => ipcRenderer.invoke('git:clear-repo'),
   getRoot: () => ipcRenderer.invoke('git:get-root'),
+  gitConfigGetMany: (opts: { scope: 'global' | 'local'; keys: string[] }) =>
+    ipcRenderer.invoke('git:config-get-many', opts),
+  gitConfigSetMany: (opts: { scope: 'global' | 'local'; entries: { key: string; value?: string | null }[] }) =>
+    ipcRenderer.invoke('git:config-set-many', opts),
   status: () => ipcRenderer.invoke('git:status'),
   stage: (paths: string[]) => ipcRenderer.invoke('git:stage', paths),
   unstage: (paths: string[], opts?: { amend?: boolean }) =>
@@ -209,6 +229,8 @@ contextBridge.exposeInMainWorld('gitClient', {
   commitDiff: (hash: string, opts: unknown, filePath: string) =>
     ipcRenderer.invoke('git:commit-diff', hash, opts, filePath),
   commitTreePaths: (hash: string) => ipcRenderer.invoke('git:commit-tree-paths', hash),
+  exportCommitArchive: (opts: { hash: string; title?: string; defaultPath?: string }) =>
+    ipcRenderer.invoke('git:export-commit-archive', opts),
   blame: (relPath: string) => ipcRenderer.invoke('git:blame', relPath),
   logFile: (opts: { path: string; maxCount?: number }) => ipcRenderer.invoke('git:log-file', opts),
   diffRange: (opts: { from: string; to: string; tripleDot?: boolean }) =>

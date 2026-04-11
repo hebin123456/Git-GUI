@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { Plus, Refresh, FolderOpened, Document, Minus, FullScreen, Close } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { setAppLocale } from '../i18n/index.ts'
 import {
@@ -11,6 +11,7 @@ import {
   normalizeAppSettings,
   saveAppSettings
 } from '../utils/appSettingsStorage.ts'
+import { getPersistentStorageItem, setPersistentStorageItem } from '../utils/persistentStorage.ts'
 import { applyAppTheme, onThemeEffectiveChange } from '../utils/appTheme.ts'
 import MmSubRepoPanel from './MmSubRepoPanel.vue'
 
@@ -51,11 +52,12 @@ function onAppSettingsStorage(e: StorageEvent) {
 }
 
 let settingsSyncChannel: BroadcastChannel | null = null
+let gitMmOutputUnsub: (() => void) | null = null
 
 const STORAGE_KEY = 'gitforklike-mm-workspaces-v1'
 const MM_START_STORAGE_KEY = 'gitforklike-mm-start-v1'
 const SYNC_JOBS_STORAGE_KEY = 'gitforklike-mm-sync-jobs-v1'
-const MM_OUTPUT_EXPANDED_KEY = 'gitforklike-mm-output-expanded'
+const SUBREPO_ORDER_STORAGE_KEY = 'gitforklike-mm-subrepo-order-v1'
 
 type MmWorkspace = { id: string; rootPath: string; label: string }
 type MmStartPersist = { branch: string }
@@ -77,10 +79,13 @@ function winClose() {
 const workspaces = ref<MmWorkspace[]>([])
 const activeWsId = ref('')
 const subPathsByWs = ref<Record<string, string[]>>({})
+const subrepoOrderByWs = ref<Record<string, string[]>>({})
 const activeSubPath = ref<Record<string, string>>({})
 const initDialog = ref(false)
 const startDialog = ref(false)
 const syncBusy = ref(false)
+const workspaceBusyDepth = ref(0)
+const workspaceBusyText = ref('')
 /** `git mm sync -j <n>` 并行任务数（与 `git mm sync -j4` 中 4 含义一致） */
 const syncParallelJobs = ref(8)
 /** 正在执行的参数（用于展示） */
@@ -97,6 +102,24 @@ type MmLastRun =
     }
   | { kind: 'spawn_error'; cmd: string; cwd: string; ms: number; message: string }
 const mmLastRun = ref<MmLastRun | null>(null)
+const mmOutputDialogOpen = ref(false)
+const mmOutputLiveText = ref('')
+const mmOutputBodyRef = ref<HTMLDivElement | null>(null)
+const workspaceDragFromIndex = ref<number | null>(null)
+const subrepoDragFromIndex = ref<number | null>(null)
+const suppressWorkspaceTabSwitch = ref(false)
+const suppressSubrepoTabSwitch = ref(false)
+const subrepoCtxMenu = ref<{
+  visible: boolean
+  x: number
+  y: number
+  repoPath: string
+}>({
+  visible: false,
+  x: 0,
+  y: 0,
+  repoPath: ''
+})
 const initUrl = ref('')
 const initManifest = ref('dependency.xml')
 const initBranch = ref('master')
@@ -105,12 +128,64 @@ const initGroup = ref('default')
 const mmStartBranch = ref('')
 
 const activeWorkspace = computed(() => workspaces.value.find((w) => w.id === activeWsId.value) ?? null)
+const workspaceBusy = computed(() => workspaceBusyDepth.value > 0)
+const workAreaBusy = computed(() => syncBusy.value || workspaceBusy.value)
+const workAreaBusyText = computed(() =>
+  syncBusy.value ? t('gitMm.mmBlockingWork') : workspaceBusyText.value || t('common.loading')
+)
+
+function beginWorkspaceBusy(text: string): () => void {
+  workspaceBusyDepth.value += 1
+  workspaceBusyText.value = text
+  let ended = false
+  return () => {
+    if (ended) return
+    ended = true
+    workspaceBusyDepth.value = Math.max(0, workspaceBusyDepth.value - 1)
+    if (!workspaceBusyDepth.value) workspaceBusyText.value = ''
+  }
+}
+
+async function runWorkspaceBusy<T>(text: string, task: () => Promise<T>): Promise<T> {
+  const endBusy = beginWorkspaceBusy(text)
+  try {
+    return await task()
+  } finally {
+    endBusy()
+  }
+}
 
 const subrepos = computed(() => {
   const w = activeWorkspace.value
   if (!w) return []
   return subPathsByWs.value[w.id] ?? []
 })
+
+function moveListItem<T>(list: T[], from: number, to: number): T[] {
+  if (from === to || from < 0 || to < 0 || from >= list.length || to >= list.length) return [...list]
+  const next = [...list]
+  const [item] = next.splice(from, 1)
+  if (item === undefined) return [...list]
+  next.splice(to, 0, item)
+  return next
+}
+
+function withSuppressedTabSwitch(flag: { value: boolean }) {
+  flag.value = true
+  window.setTimeout(() => {
+    flag.value = false
+  }, 80)
+}
+
+function mergeSubrepoOrder(wsId: string, scannedPaths: string[]): string[] {
+  const saved = subrepoOrderByWs.value[wsId] ?? []
+  if (!saved.length) return [...scannedPaths]
+  const scannedSet = new Set(scannedPaths)
+  const ordered = saved.filter((p) => scannedSet.has(p))
+  const used = new Set(ordered)
+  const rest = scannedPaths.filter((p) => !used.has(p))
+  return [...ordered, ...rest]
+}
 
 const currentSubPath = computed({
   get: () => {
@@ -127,7 +202,15 @@ const currentSubPath = computed({
 
 function persist() {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(workspaces.value))
+    setPersistentStorageItem(STORAGE_KEY, JSON.stringify(workspaces.value))
+  } catch {
+    /* ignore */
+  }
+}
+
+function persistSubrepoOrder() {
+  try {
+    setPersistentStorageItem(SUBREPO_ORDER_STORAGE_KEY, JSON.stringify(subrepoOrderByWs.value))
   } catch {
     /* ignore */
   }
@@ -136,7 +219,7 @@ function persist() {
 function persistMmStart() {
   try {
     const p: MmStartPersist = { branch: mmStartBranch.value }
-    localStorage.setItem(MM_START_STORAGE_KEY, JSON.stringify(p))
+    setPersistentStorageItem(MM_START_STORAGE_KEY, JSON.stringify(p))
   } catch {
     /* ignore */
   }
@@ -149,7 +232,7 @@ function clampSyncJobs(n: number): number {
 
 function loadSyncParallelJobs(): number {
   try {
-    const raw = localStorage.getItem(SYNC_JOBS_STORAGE_KEY)
+    const raw = getPersistentStorageItem(SYNC_JOBS_STORAGE_KEY)
     if (raw) {
       const n = Number(JSON.parse(raw))
       if (Number.isFinite(n)) return clampSyncJobs(n)
@@ -162,7 +245,7 @@ function loadSyncParallelJobs(): number {
 
 function persistSyncParallelJobs() {
   try {
-    localStorage.setItem(SYNC_JOBS_STORAGE_KEY, JSON.stringify(clampSyncJobs(syncParallelJobs.value)))
+    setPersistentStorageItem(SYNC_JOBS_STORAGE_KEY, JSON.stringify(clampSyncJobs(syncParallelJobs.value)))
   } catch {
     /* ignore */
   }
@@ -188,27 +271,43 @@ const mmStreamText = computed(() => {
   return [r.stdout, r.stderr].filter(Boolean).join('\n---\n')
 })
 
-function loadMmOutputExpanded(): boolean {
-  try {
-    return localStorage.getItem(MM_OUTPUT_EXPANDED_KEY) === '1'
-  } catch {
-    return false
+const mmOutputText = computed(() => mmOutputLiveText.value || mmStreamText.value)
+const mmCopyableText = computed(() => {
+  const r = mmLastRun.value
+  if (r?.kind === 'spawn_error') return r.message
+  return mmOutputText.value
+})
+
+function scrollMmOutputToBottom() {
+  const el = mmOutputBodyRef.value
+  if (!el) return
+  el.scrollTop = el.scrollHeight
+}
+
+function appendMmOutput(text: string) {
+  if (!text) return
+  mmOutputLiveText.value += text
+  if (mmOutputLiveText.value.length > 2_800_000) {
+    mmOutputLiveText.value = mmOutputLiveText.value.slice(-2_800_000)
+  }
+  if (mmOutputDialogOpen.value) {
+    void nextTick(() => scrollMmOutputToBottom())
   }
 }
 
-const mmOutputExpanded = ref(loadMmOutputExpanded())
-
-function persistMmOutputExpanded(v: boolean) {
-  try {
-    localStorage.setItem(MM_OUTPUT_EXPANDED_KEY, v ? '1' : '0')
-  } catch {
-    /* ignore */
-  }
+function openMmOutputDialog() {
+  mmOutputDialogOpen.value = true
 }
 
-function toggleMmOutputExpanded() {
-  mmOutputExpanded.value = !mmOutputExpanded.value
-  persistMmOutputExpanded(mmOutputExpanded.value)
+async function copyMmOutput() {
+  const text = mmCopyableText.value
+  if (!text.trim()) return
+  try {
+    await navigator.clipboard.writeText(text)
+    ElMessage.success(t('common.copied'))
+  } catch {
+    ElMessage.error(t('common.copyFailed'))
+  }
 }
 
 function shortName(full: string) {
@@ -216,23 +315,143 @@ function shortName(full: string) {
   return parts.slice(-2).join('/') || full
 }
 
+function closeSubrepoCtxMenu() {
+  subrepoCtxMenu.value.visible = false
+}
+
+function beforeWorkspaceTabLeave() {
+  return !suppressWorkspaceTabSwitch.value
+}
+
+function beforeSubrepoTabLeave() {
+  return !suppressSubrepoTabSwitch.value
+}
+
+function onWorkspaceDragStart(e: DragEvent, index: number) {
+  if (workAreaBusy.value) return
+  workspaceDragFromIndex.value = index
+  e.dataTransfer?.setData('text/plain', `mm-workspace:${index}`)
+  if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
+  closeSubrepoCtxMenu()
+}
+
+function onWorkspaceDragEnd() {
+  workspaceDragFromIndex.value = null
+  withSuppressedTabSwitch(suppressWorkspaceTabSwitch)
+}
+
+function onWorkspaceDragOver(e: DragEvent) {
+  if (workAreaBusy.value) return
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+}
+
+function onWorkspaceDrop(e: DragEvent, toIndex: number) {
+  if (workAreaBusy.value) return
+  e.preventDefault()
+  e.stopPropagation()
+  const from = workspaceDragFromIndex.value
+  if (from === null || from === toIndex) return
+  workspaces.value = moveListItem(workspaces.value, from, toIndex)
+  workspaceDragFromIndex.value = null
+  persist()
+}
+
+function onSubrepoDragStart(e: DragEvent, index: number) {
+  if (workAreaBusy.value) return
+  subrepoDragFromIndex.value = index
+  e.dataTransfer?.setData('text/plain', `mm-subrepo:${index}`)
+  if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move'
+  closeSubrepoCtxMenu()
+}
+
+function onSubrepoDragEnd() {
+  subrepoDragFromIndex.value = null
+  withSuppressedTabSwitch(suppressSubrepoTabSwitch)
+}
+
+function onSubrepoDragOver(e: DragEvent) {
+  if (workAreaBusy.value) return
+  e.preventDefault()
+  if (e.dataTransfer) e.dataTransfer.dropEffect = 'move'
+}
+
+function onSubrepoDrop(e: DragEvent, toIndex: number) {
+  if (workAreaBusy.value) return
+  e.preventDefault()
+  e.stopPropagation()
+  const from = subrepoDragFromIndex.value
+  const w = activeWorkspace.value
+  if (!w || from === null || from === toIndex) return
+  const current = subPathsByWs.value[w.id] ?? []
+  const next = moveListItem(current, from, toIndex)
+  subPathsByWs.value = { ...subPathsByWs.value, [w.id]: next }
+  subrepoOrderByWs.value = { ...subrepoOrderByWs.value, [w.id]: [...next] }
+  subrepoDragFromIndex.value = null
+  persistSubrepoOrder()
+}
+
+function clampCtxMenuPos(x: number, y: number) {
+  const pad = 8
+  const w = 260
+  const h = 120
+  return {
+    x: Math.min(x, window.innerWidth - w - pad),
+    y: Math.min(y, window.innerHeight - h - pad)
+  }
+}
+
+function openSubrepoCtxMenu(e: MouseEvent, repoPath: string) {
+  if (!repoPath || workAreaBusy.value) return
+  e.preventDefault()
+  e.stopPropagation()
+  const p = clampCtxMenuPos(e.clientX, e.clientY)
+  subrepoCtxMenu.value = {
+    visible: true,
+    x: p.x,
+    y: p.y,
+    repoPath
+  }
+}
+
+async function openSubrepoInMain(repoPath: string) {
+  const target = String(repoPath ?? '').trim()
+  closeSubrepoCtxMenu()
+  if (!target) return
+  const r = await window.gitClient.focusMainWithRepo(target)
+  if (!r.ok) ElMessage.error(r.error)
+  else ElMessage.info(t('gitMm.openInMainForAdvancedFeatures'))
+}
+
+function onGlobalPointerDown(e: MouseEvent) {
+  const t = e.target as Node
+  if (t instanceof Element && t.closest('.fork-native-ctx-menu')) return
+  closeSubrepoCtxMenu()
+}
+
 async function addWorkspace() {
+  if (syncBusy.value || workspaceBusy.value) return
   const p = await window.gitClient.selectDirectory()
   if (!p) return
   const id = `mm-ws-${Date.now()}`
   const label = p.replace(/[/\\]+$/, '').split(/[/\\]/).pop() || p
-  workspaces.value = [...workspaces.value, { id, rootPath: p, label }]
-  activeWsId.value = id
-  persist()
-  await scanSubrepos()
+  await runWorkspaceBusy(t('gitMm.loadingWorkspace', { name: label }), async () => {
+    workspaces.value = [...workspaces.value, { id, rootPath: p, label }]
+    activeWsId.value = id
+    persist()
+    await scanSubrepos({ skipBusy: true })
+  })
 }
 
 function removeWorkspace(id: string) {
-  if (syncBusy.value) return
+  if (syncBusy.value || workspaceBusy.value) return
   workspaces.value = workspaces.value.filter((w) => w.id !== id)
   const next = { ...subPathsByWs.value }
   delete next[id]
   subPathsByWs.value = next
+  const nextOrder = { ...subrepoOrderByWs.value }
+  delete nextOrder[id]
+  subrepoOrderByWs.value = nextOrder
   const sp = { ...activeSubPath.value }
   delete sp[id]
   activeSubPath.value = sp
@@ -240,23 +459,33 @@ function removeWorkspace(id: string) {
     activeWsId.value = workspaces.value[0]?.id ?? ''
   }
   persist()
+  persistSubrepoOrder()
 }
 
-async function scanSubrepos() {
+async function scanSubrepos(opts?: { skipBusy?: boolean }) {
   const w = activeWorkspace.value
   if (!w) return
-  const r = await window.gitMm.listSubrepos(w.rootPath, 4)
-  if ('error' in r) {
-    ElMessage.error(r.error)
-    return
+  if (workspaceBusy.value && !opts?.skipBusy) return
+  const run = async () => {
+    const r = await window.gitMm.listSubrepos(w.rootPath, 4)
+    if ('error' in r) {
+      ElMessage.error(r.error)
+      return
+    }
+    const ordered = mergeSubrepoOrder(w.id, r.paths)
+    subPathsByWs.value = { ...subPathsByWs.value, [w.id]: ordered }
+    subrepoOrderByWs.value = { ...subrepoOrderByWs.value, [w.id]: [...ordered] }
+    persistSubrepoOrder()
+    if (ordered.length && !ordered.includes(currentSubPath.value)) {
+      currentSubPath.value = ordered[0]!
+    }
   }
-  subPathsByWs.value = { ...subPathsByWs.value, [w.id]: r.paths }
-  if (r.paths.length && !r.paths.includes(currentSubPath.value)) {
-    currentSubPath.value = r.paths[0]!
-  }
+  if (opts?.skipBusy) return run()
+  await runWorkspaceBusy(t('gitMm.loadingSubrepos', { name: w.label }), run)
 }
 
 async function runMm(args: string[]) {
+  if (workspaceBusy.value) return
   const w = activeWorkspace.value
   if (!w) {
     ElMessage.warning(t('gitMm.needWorkspace'))
@@ -267,11 +496,25 @@ async function runMm(args: string[]) {
   syncBusy.value = true
   mmPendingArgs.value = args
   mmLastRun.value = null
+  mmOutputLiveText.value = ''
+  mmOutputDialogOpen.value = true
   const t0 = performance.now()
-  const r = await window.gitMm.exec({ cwd, args })
+  let r: Awaited<ReturnType<typeof window.gitMm.exec>> | undefined
+  try {
+    r = await window.gitMm.exec({ cwd, args })
+  } catch (e) {
+    const ms = Math.round(performance.now() - t0)
+    const message = e instanceof Error ? e.message : String(e)
+    mmLastRun.value = { kind: 'spawn_error', cmd, cwd, ms, message }
+    ElMessage.error(message)
+    await scanSubrepos()
+    return
+  } finally {
+    syncBusy.value = false
+    mmPendingArgs.value = null
+  }
   const ms = Math.round(performance.now() - t0)
-  syncBusy.value = false
-  mmPendingArgs.value = null
+  if (!r) return
   if ('error' in r) {
     mmLastRun.value = { kind: 'spawn_error', cmd, cwd, ms, message: r.error }
     ElMessage.error(r.error)
@@ -305,6 +548,7 @@ async function runSync() {
 
 /** `git mm upload` 等需在终端确认 [Y/n] 的命令 */
 async function runMmInteractive(args: string[]) {
+  if (workspaceBusy.value) return
   const w = activeWorkspace.value
   if (!w) {
     ElMessage.warning(t('gitMm.needWorkspace'))
@@ -315,6 +559,8 @@ async function runMmInteractive(args: string[]) {
   syncBusy.value = true
   mmPendingArgs.value = args
   mmLastRun.value = null
+  mmOutputLiveText.value = ''
+  mmOutputDialogOpen.value = true
   const t0 = performance.now()
 
   const un = window.gitMm.onPrompt(async (p) => {
@@ -335,16 +581,24 @@ async function runMmInteractive(args: string[]) {
     }
   })
 
-  let r: Awaited<ReturnType<typeof window.gitMm.execInteractive>>
+  let r: Awaited<ReturnType<typeof window.gitMm.execInteractive>> | undefined
   try {
     r = await window.gitMm.execInteractive({ cwd, args })
+  } catch (e) {
+    const ms = Math.round(performance.now() - t0)
+    const message = e instanceof Error ? e.message : String(e)
+    mmLastRun.value = { kind: 'spawn_error', cmd, cwd, ms, message }
+    ElMessage.error(message)
+    await scanSubrepos()
+    return
   } finally {
     un()
+    syncBusy.value = false
+    mmPendingArgs.value = null
   }
 
   const ms = Math.round(performance.now() - t0)
-  syncBusy.value = false
-  mmPendingArgs.value = null
+  if (!r) return
   if ('error' in r) {
     mmLastRun.value = { kind: 'spawn_error', cmd, cwd, ms, message: r.error }
     ElMessage.error(r.error)
@@ -386,7 +640,7 @@ async function onInitSubmit() {
 }
 
 function openStartDialog() {
-  if (syncBusy.value || !activeWorkspace.value) return
+  if (workAreaBusy.value || !activeWorkspace.value) return
   startDialog.value = true
 }
 
@@ -408,11 +662,22 @@ function openWorkspaceFolder() {
 }
 
 watch(activeWsId, () => {
+  closeSubrepoCtxMenu()
+  workspaceDragFromIndex.value = null
+  subrepoDragFromIndex.value = null
   void scanSubrepos()
+})
+
+watch([currentSubPath, workAreaBusy], () => {
+  closeSubrepoCtxMenu()
 })
 
 onMounted(() => {
   window.addEventListener('storage', onAppSettingsStorage)
+  document.addEventListener('mousedown', onGlobalPointerDown, true)
+  gitMmOutputUnsub = window.gitMm.onOutput((payload) => {
+    appendMmOutput(payload.text)
+  })
   if (typeof BroadcastChannel !== 'undefined') {
     try {
       settingsSyncChannel = new BroadcastChannel(APP_SETTINGS_SYNC_CHANNEL)
@@ -423,7 +688,7 @@ onMounted(() => {
   }
   themeEffectiveUnsub = onThemeEffectiveChange(syncHeaderAppearanceDark)
   try {
-    const startRaw = localStorage.getItem(MM_START_STORAGE_KEY)
+    const startRaw = getPersistentStorageItem(MM_START_STORAGE_KEY)
     if (startRaw) {
       const p = JSON.parse(startRaw) as MmStartPersist
       if (p && typeof p.branch === 'string') mmStartBranch.value = p.branch
@@ -432,12 +697,25 @@ onMounted(() => {
     /* ignore */
   }
   try {
-    const raw = localStorage.getItem(STORAGE_KEY)
+    const raw = getPersistentStorageItem(STORAGE_KEY)
     if (raw) {
       const arr = JSON.parse(raw) as MmWorkspace[]
       if (Array.isArray(arr) && arr.length) {
         workspaces.value = arr.filter((x) => x?.id && x?.rootPath)
         activeWsId.value = workspaces.value[0]?.id ?? ''
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    const raw = getPersistentStorageItem(SUBREPO_ORDER_STORAGE_KEY)
+    if (raw) {
+      const data = JSON.parse(raw) as Record<string, string[]>
+      if (data && typeof data === 'object' && !Array.isArray(data)) {
+        subrepoOrderByWs.value = Object.fromEntries(
+          Object.entries(data).map(([k, v]) => [k, Array.isArray(v) ? v.map((x) => String(x)) : []])
+        )
       }
     }
   } catch {
@@ -449,6 +727,9 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener('storage', onAppSettingsStorage)
+  document.removeEventListener('mousedown', onGlobalPointerDown, true)
+  gitMmOutputUnsub?.()
+  gitMmOutputUnsub = null
   if (settingsSyncChannel) {
     settingsSyncChannel.close()
     settingsSyncChannel = null
@@ -461,6 +742,10 @@ watch(syncParallelJobs, (v) => {
   const c = clampSyncJobs(Number(v) || 4)
   if (c !== v) syncParallelJobs.value = c
   persistSyncParallelJobs()
+})
+
+watch(mmOutputDialogOpen, (open) => {
+  if (open) void nextTick(() => scrollMmOutputToBottom())
 })
 </script>
 
@@ -499,148 +784,212 @@ watch(syncParallelJobs, (v) => {
       </div>
     </div>
     <div class="git-mm-app-body">
-    <header class="git-mm-head">
-      <p class="git-mm-lead">{{ t('gitMm.lead') }}</p>
-      <p class="git-mm-timeout-hint">{{ t('gitMm.mmTimeoutHint') }}</p>
-      <div class="git-mm-toolbar">
-        <el-button type="primary" size="small" :disabled="syncBusy" @click="addWorkspace">
-          <el-icon class="el-icon--left"><Plus /></el-icon>
-          {{ t('gitMm.addWorkspace') }}
-        </el-button>
-        <el-button size="small" :disabled="syncBusy || !activeWorkspace" @click="openWorkspaceFolder">
-          <el-icon class="el-icon--left"><FolderOpened /></el-icon>
-          {{ t('gitMm.openFolder') }}
-        </el-button>
-        <el-button size="small" :disabled="syncBusy || !activeWorkspace" @click="initDialog = true">
-          {{ t('gitMm.initMm') }}
-        </el-button>
-        <div class="git-mm-sync-row" :title="t('gitMm.syncParallelHint')">
-          <el-button
-            size="small"
-            type="primary"
-            plain
-            :loading="syncBusy"
-            :disabled="!activeWorkspace"
-            @click="runSync"
-          >
-            {{ t('gitMm.sync') }}
-          </el-button>
-          <span class="git-mm-sync-jobs-label">{{ t('gitMm.syncParallelJobs') }}</span>
-          <el-input-number
-            v-model="syncParallelJobs"
-            size="small"
-            :min="1"
-            :max="32"
-            :step="1"
-            :disabled="syncBusy"
-            controls-position="right"
-            class="git-mm-sync-jobs-input"
-          />
-        </div>
-        <el-button
-          size="small"
-          type="success"
-          plain
-          :loading="syncBusy"
-          :disabled="syncBusy || !activeWorkspace"
-          @click="openStartDialog"
-        >
-          {{ t('gitMm.startMm') }}
-        </el-button>
-        <el-button
-          size="small"
-          type="warning"
-          plain
-          :loading="syncBusy"
-          :disabled="syncBusy || !activeWorkspace"
-          :title="t('gitMm.uploadHint')"
-          @click="runUpload"
-        >
-          {{ t('gitMm.upload') }}
-        </el-button>
-        <el-button size="small" :disabled="syncBusy || !activeWorkspace" @click="scanSubrepos">
-          <el-icon class="el-icon--left"><Refresh /></el-icon>
-          {{ t('gitMm.refreshChildren') }}
-        </el-button>
-      </div>
-    </header>
-
-    <div class="git-mm-body">
-      <div
-        class="git-mm-work-area"
-        v-loading.lock="syncBusy"
-        :element-loading-text="t('gitMm.mmBlockingWork')"
-      >
-      <template v-if="workspaces.length">
-        <el-tabs
-          v-model="activeWsId"
-          type="card"
-          class="git-mm-ws-tabs"
-          :closable="!syncBusy"
-          @tab-remove="(name: string) => removeWorkspace(name)"
-        >
-          <el-tab-pane v-for="w in workspaces" :key="w.id" :label="w.label" :name="w.id">
-            <div class="git-mm-ws-pane">
-              <div class="git-mm-ws-path mono" :title="w.rootPath">{{ w.rootPath }}</div>
-              <template v-if="subrepos.length">
-                <el-tabs v-model="currentSubPath" type="border-card" class="git-mm-sub-tabs">
-                  <el-tab-pane
-                    v-for="p in subrepos"
-                    :key="p"
-                    :label="shortName(p)"
-                    :name="p"
-                  >
-                    <MmSubRepoPanel v-if="currentSubPath === p" :repo-path="p" />
-                  </el-tab-pane>
-                </el-tabs>
-              </template>
-              <el-empty v-else :description="t('gitMm.noSubrepos')" />
+      <header class="git-mm-head fork-header-wrap no-drag">
+        <div class="git-mm-toolbar fork-toolbar">
+          <div class="tb-tools git-mm-toolbar-actions">
+            <el-button type="primary" size="small" :disabled="workAreaBusy" @click="addWorkspace">
+              <el-icon class="el-icon--left"><Plus /></el-icon>
+              {{ t('gitMm.addWorkspace') }}
+            </el-button>
+            <el-button size="small" :disabled="workAreaBusy || !activeWorkspace" @click="openWorkspaceFolder">
+              <el-icon class="el-icon--left"><FolderOpened /></el-icon>
+              {{ t('gitMm.openFolder') }}
+            </el-button>
+            <el-button size="small" :disabled="workAreaBusy || !activeWorkspace" @click="initDialog = true">
+              {{ t('gitMm.initMm') }}
+            </el-button>
+            <div class="git-mm-sync-row" :title="t('gitMm.syncParallelHint')">
+              <el-button
+                size="small"
+                type="primary"
+                plain
+                :loading="syncBusy"
+                :disabled="workAreaBusy || !activeWorkspace"
+                @click="runSync"
+              >
+                {{ t('gitMm.sync') }}
+              </el-button>
+              <span class="git-mm-sync-jobs-label">{{ t('gitMm.syncParallelJobs') }}</span>
+              <el-input-number
+                v-model="syncParallelJobs"
+                size="small"
+                :min="1"
+                :max="32"
+                :step="1"
+                :disabled="workAreaBusy"
+                controls-position="right"
+                class="git-mm-sync-jobs-input"
+              />
             </div>
-          </el-tab-pane>
-        </el-tabs>
-      </template>
-      <el-empty v-else :description="t('gitMm.emptyWorkspaces')" />
-      </div>
-
-      <div v-if="syncBusy || mmLastRun" class="git-mm-output-dock">
-        <button
-          v-show="!mmOutputExpanded"
-          type="button"
-          class="git-mm-output-bar"
-          @click="toggleMmOutputExpanded"
-        >
-          <span class="git-mm-output-bar-title mono">{{ mmOutputCollapseTitle }}</span>
-          <el-tag v-if="syncBusy" size="small" type="warning" effect="plain">{{ t('common.loading') }}</el-tag>
-          <span class="git-mm-output-bar-action">{{ t('gitMm.mmOutputExpand') }}</span>
-        </button>
-        <div v-show="mmOutputExpanded" class="git-mm-output-expanded">
-          <div class="git-mm-output-expanded-head">
-            <span class="git-mm-output-expanded-title mono">{{ mmOutputCollapseTitle }}</span>
-            <el-button size="small" text type="primary" @click="toggleMmOutputExpanded">
-              {{ t('gitMm.mmOutputCollapse') }}
+            <el-button
+              size="small"
+              type="success"
+              plain
+              :loading="syncBusy"
+              :disabled="workAreaBusy || !activeWorkspace"
+              @click="openStartDialog"
+            >
+              {{ t('gitMm.startMm') }}
+            </el-button>
+            <el-button
+              size="small"
+              type="warning"
+              plain
+              :loading="syncBusy"
+              :disabled="workAreaBusy || !activeWorkspace"
+              :title="t('gitMm.uploadHint')"
+              @click="runUpload"
+            >
+              {{ t('gitMm.upload') }}
+            </el-button>
+            <el-button size="small" :disabled="workAreaBusy || !activeWorkspace" @click="scanSubrepos">
+              <el-icon class="el-icon--left"><Refresh /></el-icon>
+              {{ t('gitMm.refreshChildren') }}
             </el-button>
           </div>
-          <div v-if="syncBusy && mmPendingArgs" class="git-mm-run-block">
-            <pre class="git-mm-output-pre mono">{{ formatMmCmd(mmPendingArgs) }}</pre>
-            <p class="git-mm-run-meta mono">{{ activeWorkspace?.rootPath }}</p>
-            <p class="git-mm-running-hint">{{ t('gitMm.mmRunningHint') }}</p>
+          <div class="tb-center tb-center-compact git-mm-toolbar-hint">
+            <el-text
+              v-if="activeWorkspace"
+              truncated
+              type="info"
+              size="small"
+              class="repo-path-hint git-mm-active-path"
+              :title="activeWorkspace.rootPath"
+            >
+              {{ activeWorkspace.rootPath }}
+            </el-text>
+            <span v-else class="repo-title-muted git-mm-toolbar-empty-hint" :title="t('gitMm.emptyWorkspaces')">
+              {{ t('gitMm.needWorkspace') }}
+            </span>
           </div>
-          <div v-else-if="mmLastRun?.kind === 'spawn_error'" class="git-mm-run-block">
-            <pre class="git-mm-output-pre mono">{{ mmLastRun.message }}</pre>
-            <p class="git-mm-run-meta mono">{{ mmLastRun.cwd }}</p>
+          <div class="tb-right git-mm-toolbar-trailing">
+            <el-button
+              v-if="syncBusy || mmLastRun"
+              size="small"
+              plain
+              :type="syncBusy ? 'warning' : mmLastRun?.kind === 'spawn_error' ? 'danger' : 'info'"
+              @click="openMmOutputDialog"
+            >
+              {{ t('gitMm.mmOutput') }}
+            </el-button>
           </div>
-          <div v-else-if="mmLastRun?.kind === 'finished'" class="git-mm-run-block">
-            <p class="git-mm-run-meta mono">{{ mmLastRun.cmd }}</p>
-            <p class="git-mm-run-meta mono">{{ mmLastRun.cwd }}</p>
-            <p v-if="mmLastRun.code !== 0" class="git-mm-error-lines-hint">{{ t('gitMm.mmErrorLinesHint') }}</p>
-            <p v-if="!mmStreamText" class="git-mm-no-output">{{ t('gitMm.mmNoOutput') }}</p>
-            <pre v-else class="git-mm-output-pre mono">{{ mmStreamText }}</pre>
-          </div>
+        </div>
+      </header>
+
+      <div class="git-mm-body">
+        <div
+          class="git-mm-work-area fork-main"
+          v-loading.lock="workAreaBusy"
+          :element-loading-text="workAreaBusyText"
+        >
+          <template v-if="workspaces.length">
+            <el-tabs
+              v-model="activeWsId"
+              type="card"
+              class="git-mm-ws-tabs"
+              :closable="!workAreaBusy"
+              :before-leave="beforeWorkspaceTabLeave"
+              @tab-remove="(name: string) => removeWorkspace(name)"
+            >
+              <el-tab-pane v-for="(w, index) in workspaces" :key="w.id" :name="w.id">
+                <template #label>
+                  <div
+                    class="git-mm-ws-tab-label"
+                    :title="w.rootPath"
+                    :draggable="!workAreaBusy"
+                    @dragstart="onWorkspaceDragStart($event, index)"
+                    @dragend="onWorkspaceDragEnd"
+                    @dragenter.prevent="onWorkspaceDragOver"
+                    @dragover="onWorkspaceDragOver"
+                    @drop="onWorkspaceDrop($event, index)"
+                  >
+                    {{ w.label }}
+                  </div>
+                </template>
+                <div class="git-mm-ws-pane">
+                  <template v-if="subrepos.length">
+                    <el-tabs
+                      v-model="currentSubPath"
+                      type="border-card"
+                      class="git-mm-sub-tabs"
+                      :before-leave="beforeSubrepoTabLeave"
+                    >
+                      <el-tab-pane
+                        v-for="(p, index) in subrepos"
+                        :key="p"
+                        :name="p"
+                      >
+                        <template #label>
+                          <div
+                            class="git-mm-sub-tab-label"
+                            :title="p"
+                            :draggable="!workAreaBusy"
+                            @dragstart="onSubrepoDragStart($event, index)"
+                            @dragend="onSubrepoDragEnd"
+                            @dragenter.prevent="onSubrepoDragOver"
+                            @dragover="onSubrepoDragOver"
+                            @drop="onSubrepoDrop($event, index)"
+                            @contextmenu.prevent.stop="(e: MouseEvent) => openSubrepoCtxMenu(e, p)"
+                          >
+                            {{ shortName(p) }}
+                          </div>
+                        </template>
+                        <MmSubRepoPanel v-if="currentSubPath === p" :repo-path="p" />
+                      </el-tab-pane>
+                    </el-tabs>
+                  </template>
+                  <el-empty v-else :description="t('gitMm.noSubrepos')" />
+                </div>
+              </el-tab-pane>
+            </el-tabs>
+          </template>
+          <el-empty v-else class="git-mm-empty-state" :description="t('gitMm.emptyWorkspaces')" />
         </div>
       </div>
     </div>
 
-    </div>
+    <el-dialog
+      v-model="mmOutputDialogOpen"
+      :title="mmOutputCollapseTitle"
+      width="78vw"
+      top="6vh"
+      append-to-body
+      :close-on-click-modal="false"
+      class="git-mm-output-dialog"
+    >
+      <div class="git-mm-output-dialog-toolbar">
+        <div class="git-mm-run-block">
+          <p v-if="syncBusy && mmPendingArgs" class="git-mm-run-meta mono">{{ formatMmCmd(mmPendingArgs) }}</p>
+          <p v-else-if="mmLastRun" class="git-mm-run-meta mono">{{ mmLastRun.cmd }}</p>
+          <p
+            v-if="syncBusy && activeWorkspace?.rootPath"
+            class="git-mm-run-meta mono"
+          >
+            {{ activeWorkspace.rootPath }}
+          </p>
+          <p v-else-if="mmLastRun" class="git-mm-run-meta mono">{{ mmLastRun.cwd }}</p>
+        </div>
+        <div class="git-mm-output-dialog-actions">
+          <el-tag v-if="syncBusy" size="small" type="warning" effect="plain">{{ t('common.loading') }}</el-tag>
+          <el-button size="small" text :disabled="!mmCopyableText.trim()" @click="copyMmOutput">
+            {{ t('common.copy') }}
+          </el-button>
+        </div>
+      </div>
+      <p v-if="mmLastRun?.kind === 'finished' && mmLastRun.code !== 0" class="git-mm-error-lines-hint">
+        {{ t('gitMm.mmErrorLinesHint') }}
+      </p>
+      <div ref="mmOutputBodyRef" class="git-mm-output-dialog-body">
+        <div v-if="mmLastRun?.kind === 'spawn_error'" class="git-mm-run-block">
+          <pre class="git-mm-output-pre mono">{{ mmLastRun.message }}</pre>
+        </div>
+        <div v-else-if="mmOutputText" class="git-mm-run-block">
+          <pre class="git-mm-output-pre mono">{{ mmOutputText }}</pre>
+        </div>
+        <p v-else-if="syncBusy" class="git-mm-running-hint">{{ t('gitMm.mmRunningHint') }}</p>
+        <p v-else class="git-mm-no-output">{{ t('gitMm.mmNoOutput') }}</p>
+      </div>
+    </el-dialog>
 
     <el-dialog v-model="startDialog" :title="t('gitMm.startDialogTitle')" width="480px" destroy-on-close>
       <p class="git-mm-start-dialog-hint">{{ t('gitMm.startDialogHint') }}</p>
@@ -680,6 +1029,19 @@ watch(syncParallelJobs, (v) => {
         <el-button type="primary" @click="onInitSubmit">{{ t('gitMm.runInit') }}</el-button>
       </template>
     </el-dialog>
+    <Teleport to="body">
+      <div
+        v-if="subrepoCtxMenu.visible"
+        class="fork-native-ctx-menu git-mm-subrepo-ctx-menu"
+        :style="{ left: subrepoCtxMenu.x + 'px', top: subrepoCtxMenu.y + 'px' }"
+        @contextmenu.prevent
+      >
+        <button type="button" class="fork-native-ctx-item git-mm-subrepo-ctx-item" @click="openSubrepoInMain(subrepoCtxMenu.repoPath)">
+          <span class="git-mm-subrepo-ctx-title">{{ t('gitMm.subrepoCtxOpenInMain') }}</span>
+          <span class="git-mm-subrepo-ctx-hint">{{ t('gitMm.subrepoCtxOpenInMainHint') }}</span>
+        </button>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -690,7 +1052,7 @@ watch(syncParallelJobs, (v) => {
   height: 100vh;
   box-sizing: border-box;
   overflow: hidden;
-  background: var(--el-bg-color-page);
+  background: var(--el-bg-color-page, var(--el-bg-color));
 }
 .git-mm-titlebar {
   flex-shrink: 0;
@@ -757,31 +1119,34 @@ watch(syncParallelJobs, (v) => {
   min-height: 0;
   display: flex;
   flex-direction: column;
-  padding: 12px 14px;
+  padding: 8px 10px;
   overflow: hidden;
   box-sizing: border-box;
 }
 .git-mm-head {
   flex-shrink: 0;
-  margin-bottom: 10px;
-}
-.git-mm-lead {
-  margin: 6px 0 10px;
-  font-size: 13px;
-  color: var(--el-text-color-secondary);
-  line-height: 1.45;
-}
-.git-mm-timeout-hint {
-  margin: -4px 0 10px;
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  line-height: 1.4;
+  margin-bottom: 8px;
 }
 .git-mm-toolbar {
-  display: flex;
+  gap: 10px;
+}
+.git-mm-toolbar-actions {
   flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
+  min-width: 0;
+}
+.git-mm-toolbar-hint {
+  min-width: 0;
+}
+.git-mm-toolbar-empty-hint {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.git-mm-active-path {
+  max-width: 100%;
+}
+.git-mm-toolbar-trailing {
+  flex-shrink: 0;
 }
 .git-mm-sync-row {
   display: inline-flex;
@@ -820,6 +1185,28 @@ watch(syncParallelJobs, (v) => {
   flex-direction: column;
   position: relative;
 }
+.git-mm-empty-state {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  padding: 24px 16px;
+  box-sizing: border-box;
+}
+.git-mm-empty-state :deep(.el-empty) {
+  max-width: min(100%, 560px);
+  padding: 0 8px;
+  box-sizing: border-box;
+}
+.git-mm-empty-state :deep(.el-empty__description) {
+  max-width: 100%;
+  line-height: 1.6;
+  white-space: normal;
+  word-break: break-word;
+  text-align: center;
+}
 .git-mm-ws-tabs {
   flex: 1;
   min-height: 0;
@@ -831,28 +1218,47 @@ watch(syncParallelJobs, (v) => {
   min-height: 0;
   overflow: hidden;
 }
+.git-mm-ws-tab-label {
+  display: block;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: none;
+  cursor: grab;
+}
+.git-mm-ws-tab-label:active {
+  cursor: grabbing;
+}
 .git-mm-ws-tabs :deep(.el-tab-pane) {
   height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 .git-mm-ws-pane {
   display: flex;
   flex-direction: column;
-  gap: 8px;
   height: 100%;
   min-height: 0;
-}
-.git-mm-ws-path {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 .git-mm-sub-tabs {
   flex: 1;
   min-height: 0;
   display: flex;
   flex-direction: column;
+}
+.git-mm-sub-tab-label {
+  display: block;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  user-select: none;
+  cursor: grab;
+}
+.git-mm-sub-tab-label:active {
+  cursor: grabbing;
 }
 .git-mm-sub-tabs :deep(.el-tabs__content) {
   flex: 1;
@@ -862,76 +1268,37 @@ watch(syncParallelJobs, (v) => {
 }
 .git-mm-sub-tabs :deep(.el-tab-pane) {
   height: 100%;
-}
-.git-mm-output-dock {
-  flex-shrink: 0;
-  margin-top: 6px;
-  border-top: 1px solid var(--el-border-color-lighter);
-  background: var(--el-fill-color-blank);
-  border-radius: 0 0 6px 6px;
-}
-.git-mm-output-bar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  width: 100%;
-  padding: 8px 12px;
-  margin: 0;
-  border: none;
-  background: transparent;
-  cursor: pointer;
-  text-align: left;
-  font: inherit;
-  color: var(--el-text-color-primary);
-  box-sizing: border-box;
-}
-.git-mm-output-bar:hover {
-  background: var(--el-fill-color-light);
-}
-.git-mm-output-bar-title {
-  flex: 1;
-  min-width: 0;
-  font-size: 12px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.git-mm-output-bar-action {
-  flex-shrink: 0;
-  font-size: 12px;
-  color: var(--el-color-primary);
-}
-.git-mm-output-expanded {
-  padding: 0 12px 10px;
-  max-height: min(38vh, 360px);
-  overflow: auto;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
 }
-.git-mm-output-expanded-head {
+.git-mm-output-dialog :deep(.el-dialog) {
+  max-width: 1120px;
+}
+.git-mm-output-dialog-toolbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.git-mm-output-dialog-actions {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 8px;
-  padding-top: 8px;
-  position: sticky;
-  top: 0;
-  background: var(--el-fill-color-blank);
-  z-index: 1;
+  flex-shrink: 0;
 }
-.git-mm-output-expanded-title {
-  font-size: 12px;
-  color: var(--el-text-color-secondary);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  min-width: 0;
+.git-mm-output-dialog-body {
+  max-height: min(68vh, 640px);
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 6px;
+  background: var(--el-fill-color-blank);
+  box-sizing: border-box;
 }
 .git-mm-output-pre {
   margin: 0;
-  max-height: min(32vh, 280px);
-  overflow: auto;
   font-size: 12px;
   white-space: pre-wrap;
   word-break: break-word;
@@ -962,6 +1329,26 @@ watch(syncParallelJobs, (v) => {
   padding: 6px 8px;
   border-radius: 4px;
   background: var(--el-fill-color-light);
+}
+.git-mm-subrepo-ctx-menu {
+  min-width: 260px;
+}
+.git-mm-subrepo-ctx-item {
+  padding-top: 10px;
+  padding-bottom: 10px;
+}
+.git-mm-subrepo-ctx-title {
+  display: block;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--el-text-color-primary);
+}
+.git-mm-subrepo-ctx-hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--el-text-color-secondary);
 }
 .mono {
   font-family: ui-monospace, monospace;

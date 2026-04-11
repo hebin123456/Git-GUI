@@ -1,3 +1,9 @@
+import {
+  getPersistentStorageItem,
+  removePersistentStorageItem,
+  setPersistentStorageItem
+} from './persistentStorage.ts'
+
 export const WORKSPACE_STORAGE_KEY = 'git-fork-like.workspace.v1'
 
 export type PersistedWorkspaceV1 = {
@@ -15,7 +21,7 @@ export type PersistedWorkspaceV1 = {
 
 export function loadPersistedWorkspace(): PersistedWorkspaceV1 | null {
   try {
-    const raw = localStorage.getItem(WORKSPACE_STORAGE_KEY)
+    const raw = getPersistentStorageItem(WORKSPACE_STORAGE_KEY)
     if (!raw) return null
     const data = JSON.parse(raw) as PersistedWorkspaceV1
     if (data?.v !== 1 || !Array.isArray(data.repoTabs)) return null
@@ -27,7 +33,7 @@ export function loadPersistedWorkspace(): PersistedWorkspaceV1 | null {
 
 export function savePersistedWorkspace(data: PersistedWorkspaceV1): void {
   try {
-    localStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify(data))
+    setPersistentStorageItem(WORKSPACE_STORAGE_KEY, JSON.stringify(data))
   } catch {
     /* quota / private mode */
   }
@@ -35,7 +41,7 @@ export function savePersistedWorkspace(data: PersistedWorkspaceV1): void {
 
 export function clearPersistedWorkspace(): void {
   try {
-    localStorage.removeItem(WORKSPACE_STORAGE_KEY)
+    removePersistentStorageItem(WORKSPACE_STORAGE_KEY)
   } catch {
     /* empty */
   }

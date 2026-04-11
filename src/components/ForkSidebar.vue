@@ -354,7 +354,7 @@ async function confirmDeleteBranch(name: string) {
 
 <template>
   <SidebarCreateDialogs />
-  <el-aside width="272px" class="fork-sidebar">
+  <el-aside class="fork-sidebar">
     <div class="sidebar-repo-row">
       <span class="sidebar-repo-name" :title="repoPath ?? undefined">{{ repoTitle }}</span>
       <el-dropdown trigger="click" class="sidebar-repo-dropdown" @command="onRepoHeadCommand">

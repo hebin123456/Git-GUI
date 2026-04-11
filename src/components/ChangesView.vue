@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { Search, FolderOpened, Plus, Minus, Document, View, Fold, ArrowDown } from '@element-plus/icons-vue'
-import { ElMessage, ElMessageBox, ElTree } from 'element-plus'
+import { ElInput, ElMessage, ElMessageBox, ElTree } from 'element-plus'
 import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { EMPTY_DIFF_SENTINEL } from '../constants/diffSentinel.ts'
@@ -10,6 +10,7 @@ import { useGitWorkspace, type FileTreeNode } from '../composables/useGitWorkspa
 import { bindDiff2HtmlSideLayoutAndScroll } from '../utils/diff2HtmlSideScrollSync.ts'
 import { getDiffTextLineRangeFromDiff2HtmlSelection } from '../utils/diff2htmlSelectionLines.ts'
 import HunkStageDialog from './HunkStageDialog.vue'
+import ResizableSplit from './common/ResizableSplit.vue'
 
 const { t } = useI18n()
 
@@ -62,8 +63,10 @@ const {
   commitDescription,
   commitAmend,
   commitBusy,
+  recentCommitMessages,
   status,
   doCommit,
+  doCommitAndPush,
   checkoutConflictOurs,
   checkoutConflictTheirs,
   openMergetoolForPath,
@@ -85,10 +88,13 @@ const {
 } = useDiff2HtmlCopyMenu()
 
 const hunkStageOpen = ref(false)
+const commitMessagePopoverOpen = ref(false)
 
 type TreeInst = InstanceType<typeof ElTree>
+type InputInst = InstanceType<typeof ElInput>
 const unstagedTreeRef = ref<TreeInst>()
 const stagedTreeRef = ref<TreeInst>()
+const commitSubjectInputRef = ref<InputInst>()
 const diffPreRef = ref<HTMLElement | null>(null)
 
 const fileCtxMenu = ref<{
@@ -471,6 +477,20 @@ const canSubmitCommit = computed(() => {
   return displayStagedRows.value.length > 0
 })
 
+function applyRecentCommitMessage(hash: string) {
+  const picked = recentCommitMessages.value.find((item) => item.hash === hash)
+  if (!picked) return
+  commitMessagePopoverOpen.value = false
+  commitSubject.value = picked.message
+  void nextTick(() => commitSubjectInputRef.value?.focus?.())
+}
+
+function onCommitDropdownCommand(cmd: string | number | object) {
+  if (cmd === 'commit-and-push') {
+    void doCommitAndPush()
+  }
+}
+
 const canOpenHunkStage = computed(
   () =>
     !!selectedPath.value &&
@@ -608,182 +628,215 @@ function jumpConflictStep(dir: number) {
 <template>
   <!-- 单一根节点：父级 App.vue 的 v-show / fork-main-view 才能生效，避免与历史视图同时出现 -->
   <div class="changes-view-root">
-  <el-container class="changes-split" direction="horizontal">
-    <el-aside width="272px" class="fork-files change-files-aside">
-      <div class="change-files-toolbar">
-        <el-input
-          v-model="changeFileTreeSearch"
-          size="small"
-          clearable
-          :placeholder="t('changes.filterChangeFiles')"
-          class="change-files-search"
-        >
-          <template #prefix>
-            <el-icon><Search /></el-icon>
-          </template>
-        </el-input>
-        <div class="change-files-toolbar-actions">
-          <el-button size="small" text class="change-toolbar-btn" :title="t('changes.expandAll')" @click="expandChangeTrees">
-            <el-icon :size="16"><View /></el-icon>
-          </el-button>
-          <el-button size="small" text class="change-toolbar-btn" :title="t('changes.collapseAll')" @click="collapseChangeTrees">
-            <el-icon :size="16"><Fold /></el-icon>
-          </el-button>
-        </div>
-      </div>
-
-      <div class="change-files-body">
-        <div class="change-section change-section-unstaged" @contextmenu.prevent="openFileCtxMenu($event, 'unstaged')">
-          <div class="change-section-head">
-            <span class="change-section-title">{{ t('changes.unstaged') }}</span>
-            <el-button
+    <ResizableSplit
+      class="changes-split"
+      storage-key="fork-layout-changes-main"
+      :default-primary-percent="26"
+      :min-primary-percent="16"
+      :max-primary-percent="45"
+    >
+      <template #left>
+        <el-aside class="fork-files change-files-aside">
+          <div class="change-files-toolbar">
+            <el-input
+              v-model="changeFileTreeSearch"
               size="small"
-              :disabled="!hasUnstagedSelectionToStage"
-              @click="() => void stageAllUnstaged()"
+              clearable
+              :placeholder="t('changes.filterChangeFiles')"
+              class="change-files-search"
             >
-              {{ t('changes.stageAll') }}
-            </el-button>
-          </div>
-          <el-scrollbar class="change-section-scroll">
-            <el-tree
-              v-if="filteredUnstagedRows.length"
-              ref="unstagedTreeRef"
-              :key="'u-' + treeLayoutTick"
-              :data="unstagedTreeData"
-              node-key="id"
-              :props="{
-                label: 'label',
-                children: 'children',
-                class: (d) => changeTreeNodeClass('unstaged', d as FileTreeNode)
-              }"
-              :default-expand-all="treeExpandedByDefault"
-              class="file-tree change-file-tree"
-              @node-click="(d, _n, _c, e) => onUnstagedTreeNodeClick(d, _n, e)"
-              @node-contextmenu="(e, d) => openFileCtxMenuFromNode(e, d, 'unstaged')"
-            >
-              <template #default="{ data }">
-                <span
-                  class="file-tree-node"
-                  :title="data.row ? data.row.label : data.label"
-                  @dblclick.stop="onUnstagedTreeDblClick(data, $event)"
-                >
-                  <span v-if="data.children" class="file-tree-dir-ico">
-                    <el-icon><FolderOpened /></el-icon>
-                  </span>
-                  <span v-else-if="data.row" class="file-tree-glyphs">
-                    <template v-for="g in [statusGlyphsForRow(data.row, 'unstaged')]" :key="data.row.path">
-                      <span v-if="g.modified" class="glyph-modified">M</span>
-                      <template v-else>
-                        <el-icon v-if="g.plus" class="glyph-plus">
-                          <Plus />
-                        </el-icon>
-                        <el-icon v-if="g.minus" class="glyph-minus">
-                          <Minus />
-                        </el-icon>
-                      </template>
-                    </template>
-                  </span>
-                  <span class="file-tree-label">{{ data.label }}</span>
-                </span>
+              <template #prefix>
+                <el-icon><Search /></el-icon>
               </template>
-            </el-tree>
-            <div v-else class="file-tree-empty">{{
-              changeFileTreeSearch.trim() && unstagedRows.length && !filteredUnstagedRows.length
-                ? t('changes.noFilterMatch')
-                : t('common.none')
-            }}</div>
-          </el-scrollbar>
-        </div>
-
-        <div class="change-section change-section-staged" @contextmenu.prevent="openFileCtxMenu($event, 'staged')">
-          <div class="change-section-head">
-            <span class="change-section-title">{{ t('changes.staged') }}</span>
-            <el-button
-              size="small"
-              :disabled="!hasStagedSelectionToUnstage"
-              @click="() => void unstageAllStaged()"
-            >
-              {{ t('changes.unstageAll') }}
-            </el-button>
+            </el-input>
+            <div class="change-files-toolbar-actions">
+              <el-button size="small" text class="change-toolbar-btn" :title="t('changes.expandAll')" @click="expandChangeTrees">
+                <el-icon :size="16"><View /></el-icon>
+              </el-button>
+              <el-button size="small" text class="change-toolbar-btn" :title="t('changes.collapseAll')" @click="collapseChangeTrees">
+                <el-icon :size="16"><Fold /></el-icon>
+              </el-button>
+            </div>
           </div>
-          <el-scrollbar class="change-section-scroll">
-            <el-tree
-              v-if="filteredStagedRows.length"
-              ref="stagedTreeRef"
-              :key="'s-' + treeLayoutTick"
-              :data="stagedTreeData"
-              node-key="id"
-              :props="{
-                label: 'label',
-                children: 'children',
-                class: (d) => changeTreeNodeClass('staged', d as FileTreeNode)
-              }"
-              :default-expand-all="treeExpandedByDefault"
-              class="file-tree change-file-tree"
-              @node-click="(d, _n, _c, e) => onStagedTreeNodeClick(d, _n, e)"
-              @node-contextmenu="(e, d) => openFileCtxMenuFromNode(e, d, 'staged')"
-            >
-              <template #default="{ data }">
-                <span
-                  class="file-tree-node"
-                  :title="data.row ? data.row.label : data.label"
-                  @dblclick.stop="onStagedTreeDblClick(data, $event)"
-                >
-                  <span v-if="data.children" class="file-tree-dir-ico">
-                    <el-icon><FolderOpened /></el-icon>
-                  </span>
-                  <span v-else-if="data.row" class="file-tree-glyphs">
-                    <template v-for="g in [statusGlyphsForRow(data.row, 'staged')]" :key="data.row.path">
-                      <span v-if="g.modified" class="glyph-modified">M</span>
-                      <template v-else>
-                        <el-icon v-if="g.plus" class="glyph-plus">
-                          <Plus />
-                        </el-icon>
-                        <el-icon v-if="g.minus" class="glyph-minus">
-                          <Minus />
-                        </el-icon>
-                      </template>
-                    </template>
-                  </span>
-                  <span class="file-tree-label">{{ data.label }}</span>
-                </span>
-              </template>
-            </el-tree>
-            <div v-else class="file-tree-empty">{{
-              changeFileTreeSearch.trim() && displayStagedRows.length && !filteredStagedRows.length
-                ? t('changes.noFilterMatch')
-                : t('common.none')
-            }}</div>
-          </el-scrollbar>
-        </div>
-      </div>
-    </el-aside>
 
-    <!-- 勿用 <main>：外层 App 已是 el-main→<main>，再嵌套 main 违反 HTML5，浏览器会错误拆 DOM 导致整栏白屏 -->
-    <div class="fork-diff change-detail-main" role="main">
-      <div v-if="conflictedPaths.length" class="change-conflict-panel">
-        <div class="change-conflict-head">
-          <span class="change-conflict-title">{{ t('changes.conflictTitle', { n: conflictedPaths.length }) }}</span>
-          <span class="change-conflict-hint">
-            {{ t('changes.conflictHint', { marker: t('changes.conflictMarker') }) }}
-          </span>
-        </div>
-        <ul class="change-conflict-list">
-          <li v-for="cp in conflictedPaths" :key="cp" class="change-conflict-row">
-            <span class="change-conflict-path mono" :title="cp">{{ cp }}</span>
-            <span class="change-conflict-actions">
-              <el-button size="small" text type="primary" @click="checkoutConflictOurs(cp)">{{
-                t('changes.checkoutOurs')
-              }}</el-button>
-              <el-button size="small" text type="primary" @click="checkoutConflictTheirs(cp)">{{
-                t('changes.checkoutTheirs')
-              }}</el-button>
-              <el-button size="small" text @click="() => void openMergetoolForPath(cp)">{{ t('changes.mergetool') }}</el-button>
-            </span>
-          </li>
-        </ul>
-      </div>
-      <div class="change-detail-preview">
+          <div class="change-files-body">
+            <ResizableSplit
+              class="change-files-sections-split"
+              direction="vertical"
+              storage-key="fork-layout-changes-file-sections"
+              :default-primary-percent="50"
+              :min-primary-percent="22"
+              :max-primary-percent="78"
+            >
+              <template #top>
+                <div class="change-section change-section-unstaged" @contextmenu.prevent="openFileCtxMenu($event, 'unstaged')">
+                  <div class="change-section-head">
+                    <span class="change-section-title">{{ t('changes.unstaged') }}</span>
+                    <el-button
+                      size="small"
+                      :disabled="!hasUnstagedSelectionToStage"
+                      @click="() => void stageAllUnstaged()"
+                    >
+                      {{ t('changes.stageAll') }}
+                    </el-button>
+                  </div>
+                  <el-scrollbar class="change-section-scroll">
+                    <el-tree
+                      v-if="filteredUnstagedRows.length"
+                      ref="unstagedTreeRef"
+                      :key="'u-' + treeLayoutTick"
+                      :data="unstagedTreeData"
+                      node-key="id"
+                      :props="{
+                        label: 'label',
+                        children: 'children',
+                        class: (d) => changeTreeNodeClass('unstaged', d as FileTreeNode)
+                      }"
+                      :default-expand-all="treeExpandedByDefault"
+                      class="file-tree change-file-tree"
+                      @node-click="(d, _n, _c, e) => onUnstagedTreeNodeClick(d, _n, e)"
+                      @node-contextmenu="(e, d) => openFileCtxMenuFromNode(e, d, 'unstaged')"
+                    >
+                      <template #default="{ data }">
+                        <span
+                          class="file-tree-node"
+                          :title="data.row ? data.row.label : data.label"
+                          @dblclick.stop="onUnstagedTreeDblClick(data, $event)"
+                        >
+                          <span v-if="data.children" class="file-tree-dir-ico">
+                            <el-icon><FolderOpened /></el-icon>
+                          </span>
+                          <span v-else-if="data.row" class="file-tree-glyphs">
+                            <template v-for="g in [statusGlyphsForRow(data.row, 'unstaged')]" :key="data.row.path">
+                              <span v-if="g.modified" class="glyph-modified">M</span>
+                              <template v-else>
+                                <el-icon v-if="g.plus" class="glyph-plus">
+                                  <Plus />
+                                </el-icon>
+                                <el-icon v-if="g.minus" class="glyph-minus">
+                                  <Minus />
+                                </el-icon>
+                              </template>
+                            </template>
+                          </span>
+                          <span class="file-tree-label">{{ data.label }}</span>
+                        </span>
+                      </template>
+                    </el-tree>
+                    <div v-else class="file-tree-empty">{{
+                      changeFileTreeSearch.trim() && unstagedRows.length && !filteredUnstagedRows.length
+                        ? t('changes.noFilterMatch')
+                        : t('common.none')
+                    }}</div>
+                  </el-scrollbar>
+                </div>
+              </template>
+
+              <template #bottom>
+                <div class="change-section change-section-staged" @contextmenu.prevent="openFileCtxMenu($event, 'staged')">
+                  <div class="change-section-head">
+                    <span class="change-section-title">{{ t('changes.staged') }}</span>
+                    <el-button
+                      size="small"
+                      :disabled="!hasStagedSelectionToUnstage"
+                      @click="() => void unstageAllStaged()"
+                    >
+                      {{ t('changes.unstageAll') }}
+                    </el-button>
+                  </div>
+                  <el-scrollbar class="change-section-scroll">
+                    <el-tree
+                      v-if="filteredStagedRows.length"
+                      ref="stagedTreeRef"
+                      :key="'s-' + treeLayoutTick"
+                      :data="stagedTreeData"
+                      node-key="id"
+                      :props="{
+                        label: 'label',
+                        children: 'children',
+                        class: (d) => changeTreeNodeClass('staged', d as FileTreeNode)
+                      }"
+                      :default-expand-all="treeExpandedByDefault"
+                      class="file-tree change-file-tree"
+                      @node-click="(d, _n, _c, e) => onStagedTreeNodeClick(d, _n, e)"
+                      @node-contextmenu="(e, d) => openFileCtxMenuFromNode(e, d, 'staged')"
+                    >
+                      <template #default="{ data }">
+                        <span
+                          class="file-tree-node"
+                          :title="data.row ? data.row.label : data.label"
+                          @dblclick.stop="onStagedTreeDblClick(data, $event)"
+                        >
+                          <span v-if="data.children" class="file-tree-dir-ico">
+                            <el-icon><FolderOpened /></el-icon>
+                          </span>
+                          <span v-else-if="data.row" class="file-tree-glyphs">
+                            <template v-for="g in [statusGlyphsForRow(data.row, 'staged')]" :key="data.row.path">
+                              <span v-if="g.modified" class="glyph-modified">M</span>
+                              <template v-else>
+                                <el-icon v-if="g.plus" class="glyph-plus">
+                                  <Plus />
+                                </el-icon>
+                                <el-icon v-if="g.minus" class="glyph-minus">
+                                  <Minus />
+                                </el-icon>
+                              </template>
+                            </template>
+                          </span>
+                          <span class="file-tree-label">{{ data.label }}</span>
+                        </span>
+                      </template>
+                    </el-tree>
+                    <div v-else class="file-tree-empty">{{
+                      changeFileTreeSearch.trim() && displayStagedRows.length && !filteredStagedRows.length
+                        ? t('changes.noFilterMatch')
+                        : t('common.none')
+                    }}</div>
+                  </el-scrollbar>
+                </div>
+              </template>
+            </ResizableSplit>
+          </div>
+        </el-aside>
+      </template>
+
+      <template #right>
+        <!-- 勿用 <main>：外层 App 已是 el-main→<main>，再嵌套 main 违反 HTML5，浏览器会错误拆 DOM 导致整栏白屏 -->
+        <div class="fork-diff change-detail-main" role="main">
+          <ResizableSplit
+            class="change-detail-split"
+            direction="vertical"
+            storage-key="fork-layout-changes-detail"
+            :default-primary-percent="76"
+            :min-primary-percent="38"
+            :max-primary-percent="90"
+          >
+            <template #top>
+              <div class="change-detail-preview">
+                <div v-if="conflictedPaths.length" class="change-conflict-panel">
+                  <div class="change-conflict-head">
+                    <span class="change-conflict-title">{{ t('changes.conflictTitle', { n: conflictedPaths.length }) }}</span>
+                    <span class="change-conflict-hint">
+                      {{ t('changes.conflictHint', { marker: t('changes.conflictMarker') }) }}
+                    </span>
+                  </div>
+                  <ul class="change-conflict-list">
+                    <li v-for="cp in conflictedPaths" :key="cp" class="change-conflict-row">
+                      <span class="change-conflict-path mono" :title="cp">{{ cp }}</span>
+                      <span class="change-conflict-actions">
+                        <el-button size="small" text type="primary" @click="checkoutConflictOurs(cp)">{{
+                          t('changes.checkoutOurs')
+                        }}</el-button>
+                        <el-button size="small" text type="primary" @click="checkoutConflictTheirs(cp)">{{
+                          t('changes.checkoutTheirs')
+                        }}</el-button>
+                        <el-button size="small" text @click="() => void openMergetoolForPath(cp)">{{
+                          t('changes.mergetool')
+                        }}</el-button>
+                      </span>
+                    </li>
+                  </ul>
+                </div>
         <div class="change-detail-topbar">
           <div class="change-detail-file-head">
             <el-icon class="change-detail-file-ico" :size="20"><Document /></el-icon>
@@ -959,41 +1012,99 @@ function jumpConflictStep(dir: number) {
           >
           <div v-else class="change-detail-placeholder">{{ t('changes.noContent') }}</div>
         </el-scrollbar>
-      </div>
-
-      <div class="change-commit-panel">
-        <el-input v-model="commitSubject" class="change-commit-subject" :placeholder="t('changes.commitSubject')" clearable />
-        <el-input
-          v-model="commitDescription"
-          type="textarea"
-          :rows="3"
-          resize="none"
-          class="change-commit-body"
-          :placeholder="t('changes.commitBody')"
-        />
-        <div class="change-commit-footer">
-          <el-checkbox v-model="commitAmend">{{ t('changes.commitAmend') }}</el-checkbox>
-          <el-dropdown
-            split-button
-            type="primary"
-            class="change-commit-split"
-            :loading="commitBusy"
-            :disabled="
-              commitBusy || !canSubmitCommit || (!!status?.isClean && !commitAmend)
-            "
-            @click="doCommit"
-          >
-            {{ t('changes.commit') }}
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item disabled>{{ t('changes.commitMoreLater') }}</el-dropdown-item>
-              </el-dropdown-menu>
+              </div>
             </template>
-          </el-dropdown>
+            <template #bottom>
+              <div class="change-commit-panel">
+                <div class="change-commit-top">
+                  <el-input
+                    ref="commitSubjectInputRef"
+                    v-model="commitSubject"
+                    class="change-commit-subject"
+                    :placeholder="t('changes.commitSubject')"
+                    clearable
+                  >
+                    <template #append>
+                      <el-popover
+                        v-model:visible="commitMessagePopoverOpen"
+                        trigger="click"
+                        placement="bottom-end"
+                        :width="380"
+                        :teleported="true"
+                        :popper-options="{ strategy: 'fixed' }"
+                        popper-class="change-commit-message-popper"
+                      >
+                        <div class="change-commit-message-panel">
+                          <div v-if="recentCommitMessages.length" class="change-commit-message-list">
+                            <el-scrollbar max-height="320" class="change-commit-message-scroll">
+                              <button
+                                v-for="item in recentCommitMessages"
+                                :key="item.hash"
+                                type="button"
+                                class="change-commit-message-btn"
+                                @click="applyRecentCommitMessage(item.hash)"
+                              >
+                                <div class="change-commit-message-entry">
+                                  <div class="change-commit-message-text">{{ item.message }}</div>
+                                  <div class="change-commit-message-meta">{{ item.shortHash }}</div>
+                                </div>
+                              </button>
+                            </el-scrollbar>
+                          </div>
+                          <div v-else class="change-commit-message-empty">
+                            {{ t('changes.commitMessageHistoryEmpty') }}
+                          </div>
+                        </div>
+                        <template #reference>
+                          <el-button
+                            text
+                            class="change-commit-history-btn"
+                            :icon="ArrowDown"
+                            :title="t('changes.commitMessageHistory')"
+                            :aria-label="t('changes.commitMessageHistory')"
+                          />
+                        </template>
+                      </el-popover>
+                    </template>
+                  </el-input>
+                  <el-dropdown
+                    split-button
+                    type="primary"
+                    class="change-commit-split"
+                    :loading="commitBusy"
+                    :disabled="
+                      commitBusy || !canSubmitCommit || (!!status?.isClean && !commitAmend)
+                    "
+                    @click="doCommit"
+                    @command="onCommitDropdownCommand"
+                  >
+                    {{ t('changes.commit') }}
+                    <template #dropdown>
+                      <el-dropdown-menu>
+                        <el-dropdown-item command="commit-and-push">
+                          {{ t('changes.commitAndPush') }}
+                        </el-dropdown-item>
+                      </el-dropdown-menu>
+                    </template>
+                  </el-dropdown>
+                </div>
+                <el-input
+                  v-model="commitDescription"
+                  type="textarea"
+                  :rows="2"
+                  resize="none"
+                  class="change-commit-body"
+                  :placeholder="t('changes.commitBody')"
+                />
+                <div class="change-commit-footer">
+                  <el-checkbox v-model="commitAmend">{{ t('changes.commitAmend') }}</el-checkbox>
+                </div>
+              </div>
+            </template>
+          </ResizableSplit>
         </div>
-      </div>
-    </div>
-  </el-container>
+      </template>
+    </ResizableSplit>
 
   <Teleport to="body">
     <div

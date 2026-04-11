@@ -21,6 +21,7 @@ import HistoryView from './components/HistoryView.vue'
 import WelcomeView from './components/WelcomeView.vue'
 import SettingsDialog from './components/SettingsDialog.vue'
 import StashDetailDialog from './components/StashDetailDialog.vue'
+import ResizableSplit from './components/common/ResizableSplit.vue'
 
 const {
   loadError,
@@ -110,16 +111,33 @@ useDismissContextMenusOnOutside()
 
     <GitOperationBanner />
 
-    <el-container class="fork-shell" direction="horizontal">
-      <ForkSidebar v-if="repoPath" />
+    <template v-if="repoPath">
+      <ResizableSplit
+        class="fork-shell fork-shell-split"
+        storage-key="fork-layout-main-shell"
+        :default-primary-percent="21"
+        :min-primary-percent="14"
+        :max-primary-percent="42"
+      >
+        <template #left>
+          <ForkSidebar />
+        </template>
+        <template #right>
+          <el-container direction="vertical" class="fork-right">
+            <AppHeader />
+            <el-main class="fork-main">
+              <ChangesView v-show="activeView === 'changes'" class="fork-main-view" />
+              <HistoryView v-show="activeView === 'history'" class="fork-main-view" />
+            </el-main>
+          </el-container>
+        </template>
+      </ResizableSplit>
+    </template>
+    <el-container v-else class="fork-shell" direction="horizontal">
       <el-container direction="vertical" class="fork-right">
         <AppHeader />
         <el-main class="fork-main">
-          <template v-if="repoPath">
-            <ChangesView v-show="activeView === 'changes'" class="fork-main-view" />
-            <HistoryView v-show="activeView === 'history'" class="fork-main-view" />
-          </template>
-          <WelcomeView v-else />
+          <WelcomeView />
         </el-main>
       </el-container>
     </el-container>

@@ -11,6 +11,7 @@ import { loadAppSettings } from '../utils/appSettingsStorage.ts'
 import { onThemeEffectiveChange } from '../utils/appTheme.ts'
 import { isBinaryDiffOutput } from '../utils/binaryDiffDetect.ts'
 import { extractPartialLinePatchForLineRange } from '../utils/diffLineRangePatch.ts'
+import { extractRecentCommitMessages, type RecentCommitMessageEntry } from '../utils/recentCommitMessages.ts'
 import {
   buildChangeFileRowsFromStatus,
   pathForCommitTreeLayout,
@@ -19,6 +20,7 @@ import {
   type ChangeFileRow,
   type ChangeFileTreeNode
 } from '../utils/changeFileRows.ts'
+import type { CommitDetail } from '../types/git-client.ts'
 import type { FileTreeNode } from './useGitWorkspace.ts'
 import type { ChangesWorkspaceInjection } from './changesWorkspaceInjection.ts'
 
@@ -69,6 +71,31 @@ function collectPathsFromTreeNode(node: ChangeFileTreeNode): string[] {
   return node.children.flatMap(collectPathsFromTreeNode)
 }
 
+function commitDetailFilesToAmendRows(files: { path: string; status: string }[]): ChangeFileRow[] {
+  return files.map((f) => {
+    const layout = pathForCommitTreeLayout(f.path)
+    const name = layout.split(/[/\\]/).filter(Boolean).pop() ?? f.path
+    return {
+      path: f.path,
+      label: `${f.status} ${name}`,
+      staged: true,
+      unstaged: false,
+      index: ' ',
+      workingDir: ' ',
+      amendCommitStatus: f.status
+    }
+  })
+}
+
+function fileRowMatchingAmendPath(amendPath: string, rows: ChangeFileRow[]): ChangeFileRow | undefined {
+  const k = pathForCommitTreeLayout(amendPath)
+  return rows.find((fr) => fr.path === amendPath || pathForCommitTreeLayout(fr.path) === k)
+}
+
+function pathsMatchAmend(rowPath: string, amendPath: string): boolean {
+  return rowPath === amendPath || pathForCommitTreeLayout(rowPath) === pathForCommitTreeLayout(amendPath)
+}
+
 /**
  * Git MM 子仓内复用 ChangesView：与主窗口 useGitWorkspace 对齐的字段子集，经 provide 注入。
  */
@@ -97,6 +124,10 @@ export function useGitMmChangesWorkspace(repoPath: Ref<string>): ChangesWorkspac
   const commitDescription = ref('')
   const commitAmend = ref(false)
   const commitBusy = ref(false)
+  const recentCommitMessages = ref<RecentCommitMessageEntry[]>([])
+  const amendHeadDetail = ref<CommitDetail | null>(null)
+  const commitFieldsBeforeAmend = ref<{ subject: string; description: string } | null>(null)
+  let amendLoadSeq = 0
 
   const unstagedSelectedPaths = ref<string[]>([])
   const stagedSelectedPaths = ref<string[]>([])
@@ -107,12 +138,83 @@ export function useGitMmChangesWorkspace(repoPath: Ref<string>): ChangesWorkspac
   let stagedTreeClickTimer: ReturnType<typeof setTimeout> | null = null
 
   const selectedWorkingFileSize = ref<number | null>(null)
+  const actionBusyDepth = ref(0)
+  const actionBusyText = ref('')
+
+  const actionBusy = computed(() => actionBusyDepth.value > 0)
+
+  function beginActionBusy(text: string): () => void {
+    actionBusyDepth.value += 1
+    const prev = actionBusyText.value
+    actionBusyText.value = text || tr('common.loading')
+    let done = false
+    return () => {
+      if (done) return
+      done = true
+      actionBusyDepth.value = Math.max(0, actionBusyDepth.value - 1)
+      actionBusyText.value = actionBusyDepth.value > 0 ? prev : ''
+    }
+  }
+
+  async function runActionBusy<T>(text: string, task: () => Promise<T>): Promise<T> {
+    const end = beginActionBusy(text)
+    try {
+      return await task()
+    } finally {
+      end()
+    }
+  }
 
   const fileRows = computed(() => buildChangeFileRowsFromStatus(status.value))
   const stagedRows = computed(() => fileRows.value.filter((r) => r.staged))
   const unstagedRows = computed(() => fileRows.value.filter((r) => r.unstaged))
-  /** 子仓暂不做「修订上次提交」的 HEAD 文件列表覆盖 */
-  const displayStagedRows = stagedRows
+
+  function buildAmendDisplayStagedRows(): ChangeFileRow[] {
+    const detail = amendHeadDetail.value
+    if (!detail?.files?.length) return stagedRows.value
+    const amendRows = commitDetailFilesToAmendRows(detail.files)
+    const amendKeys = new Set(detail.files.map((f) => pathForCommitTreeLayout(f.path)))
+    const out: ChangeFileRow[] = []
+
+    for (const ar of amendRows) {
+      const sr = stagedRows.value.find((r) => pathsMatchAmend(r.path, ar.path))
+      if (sr) {
+        const inAmend = amendKeys.has(pathForCommitTreeLayout(ar.path))
+        if (inAmend && sr.staged && sr.unstaged) continue
+        out.push({
+          ...ar,
+          label: sr.label,
+          index: sr.index,
+          workingDir: sr.workingDir,
+          unstaged: sr.unstaged
+        })
+        continue
+      }
+      const live = fileRowMatchingAmendPath(ar.path, fileRows.value)
+      if (!live) {
+        out.push(ar)
+      }
+    }
+
+    for (const sr of stagedRows.value) {
+      const k = pathForCommitTreeLayout(sr.path)
+      if (amendKeys.has(k) && sr.staged && sr.unstaged) continue
+      if (!amendKeys.has(k)) out.push(sr)
+    }
+
+    return out.sort((a, b) =>
+      pathForCommitTreeLayout(a.path).localeCompare(pathForCommitTreeLayout(b.path), undefined, {
+        sensitivity: 'base'
+      })
+    )
+  }
+
+  const displayStagedRows = computed(() => {
+    if (commitAmend.value && amendHeadDetail.value?.files?.length) {
+      return buildAmendDisplayStagedRows()
+    }
+    return stagedRows.value
+  })
 
   const filteredUnstagedRows = computed(() => {
     const q = changeFileTreeSearch.value.trim().toLowerCase()
@@ -431,6 +533,18 @@ export function useGitMmChangesWorkspace(repoPath: Ref<string>): ChangesWorkspac
     void i18n.global.locale.value
     const p = selectedPath.value
     if (!p) return { text: '', kind: 'none' as const }
+    if (commitAmend.value && amendHeadDetail.value) {
+      const af = amendHeadDetail.value.files.find((f) => pathsMatchAmend(f.path, p))
+      if (af) {
+        const st = af.status.trim().toUpperCase()
+        const c0 = st[0] || 'M'
+        if (c0 === 'A') return { text: tr('changes.fileStatusAdded'), kind: 'created' as const }
+        if (c0 === 'D') return { text: tr('changes.fileStatusDeleted'), kind: 'deleted' as const }
+        if (c0 === 'R' || c0 === 'C')
+          return { text: tr('changes.fileStatusRenamedCopy'), kind: 'renamed' as const }
+        return { text: tr('changes.fileStatusModified'), kind: 'modified' as const }
+      }
+    }
     const s = status.value
     if (!s) return { text: '', kind: 'none' as const }
     if (s.conflicted.includes(p)) return { text: tr('changes.fileStatusConflict'), kind: 'conflict' as const }
@@ -470,10 +584,21 @@ export function useGitMmChangesWorkspace(repoPath: Ref<string>): ChangesWorkspac
     if (!p || !root) return
     diffLoading.value = true
     try {
-      const raw =
-        selectedDiffScope.value === 'staged'
-          ? await at.diffStaged(root, p, diffOptions.value)
-          : await at.diff(root, p, diffOptions.value)
+      let raw: string | { error: string }
+      if (selectedDiffScope.value === 'staged') {
+        const inIndex = stagedRows.value.some(
+          (r) => r.path === p || pathForCommitTreeLayout(r.path) === pathForCommitTreeLayout(p)
+        )
+        if (commitAmend.value && amendHeadDetail.value?.fullHash) {
+          raw = inIndex
+            ? await at.diffStaged(root, p, diffOptions.value)
+            : await at.commitDiff(root, amendHeadDetail.value.fullHash, diffOptions.value, p)
+        } else {
+          raw = await at.diffStaged(root, p, diffOptions.value)
+        }
+      } else {
+        raw = await at.diff(root, p, diffOptions.value)
+      }
       if (typeof raw !== 'string') {
         diffText.value = formatDiff(raw)
         return
@@ -501,21 +626,82 @@ export function useGitMmChangesWorkspace(repoPath: Ref<string>): ChangesWorkspac
     }
   )
 
+  watch([changeFileTreeSearch, selectedDiffScope, unstagedRows], () => {
+    if (selectedDiffScope.value !== 'unstaged') return
+    const list = filteredUnstagedRows.value
+    if (!list.length) {
+      selectedPath.value = null
+      diffText.value = ''
+      diffLooksBinary.value = false
+      return
+    }
+    const cur = selectedPath.value
+    if (!cur || !list.some((r) => r.path === cur)) {
+      selectedPath.value = list[0]!.path
+    }
+  })
+
+  watch([filteredStagedRows, selectedDiffScope, displayStagedRows], () => {
+    if (selectedDiffScope.value !== 'staged') return
+    const list = filteredStagedRows.value
+    if (!list.length) {
+      if (commitAmend.value && !amendHeadDetail.value) return
+      selectedPath.value = null
+      diffText.value = ''
+      diffLooksBinary.value = false
+      return
+    }
+    const cur = selectedPath.value
+    if (!cur || !list.some((r) => r.path === cur)) {
+      selectedPath.value = list[0]!.path
+    }
+  })
+
+  watch(
+    () => status.value,
+    () => {
+      const cur = selectedPath.value
+      const inAmendFiles =
+        !!cur &&
+        commitAmend.value &&
+        !!amendHeadDetail.value?.files.some((f) => pathsMatchAmend(f.path, cur))
+      if (cur && !fileRows.value.some((r) => pathsMatchAmend(r.path, cur)) && !inAmendFiles) {
+        selectedPath.value = fileRows.value[0]?.path ?? null
+      }
+      const row = selectedPath.value
+        ? fileRows.value.find((r) => pathsMatchAmend(r.path, selectedPath.value!)) ?? null
+        : null
+      const pathStillAmend =
+        !!selectedPath.value &&
+        commitAmend.value &&
+        !!amendHeadDetail.value?.files.some((f) => pathsMatchAmend(f.path, selectedPath.value!))
+      if (row && !pathStillAmend) {
+        if (selectedDiffScope.value === 'staged' && !row.staged && row.unstaged) selectedDiffScope.value = 'unstaged'
+        if (selectedDiffScope.value === 'unstaged' && !row.unstaged && row.staged) selectedDiffScope.value = 'staged'
+      }
+      void loadDiff()
+    }
+  )
+
   async function stagePaths(paths: string[]) {
     if (!paths.length) return
-    const r = await at.stage(repoPath.value, paths)
-    if ('error' in r) ElMessage.error(r.error)
-    else notifyMain('stage')
-    await refreshAll()
+    await runActionBusy(tr('ws.loadingStage'), async () => {
+      const r = await at.stage(repoPath.value, paths)
+      if ('error' in r) ElMessage.error(r.error)
+      else notifyMain('stage')
+      await refreshAll()
+    })
   }
 
   async function unstagePaths(paths: string[]) {
     if (!paths.length) return
     const resolved = paths.map((p) => (p.includes(' → ') ? pathForCommitTreeLayout(p) : p))
-    const r = await at.unstage(repoPath.value, resolved)
-    if ('error' in r) ElMessage.error(r.error)
-    else notifyMain('unstage')
-    await refreshAll()
+    await runActionBusy(tr('ws.loadingUnstage'), async () => {
+      const r = await at.unstage(repoPath.value, resolved, commitAmend.value ? { amend: true } : undefined)
+      if ('error' in r) ElMessage.error(r.error)
+      else notifyMain('unstage')
+      await refreshAll()
+    })
   }
 
   async function stageAllUnstaged() {
@@ -543,14 +729,16 @@ export function useGitMmChangesWorkspace(repoPath: Ref<string>): ChangesWorkspac
   async function restoreWorktreePaths(paths: string[]) {
     if (!paths.length) return
     const resolved = paths.map((p) => (p.includes(' → ') ? pathForCommitTreeLayout(p) : p))
-    const r = await at.restoreWorktree(repoPath.value, resolved)
-    if ('error' in r) {
-      ElMessage.error(r.error)
-      return
-    }
-    ElMessage.success(tr('changes.filesRestored'))
-    await refreshAll()
-    notifyMain('restore')
+    await runActionBusy(tr('ws.loadingRestoreWorktree'), async () => {
+      const r = await at.restoreWorktree(repoPath.value, resolved)
+      if ('error' in r) {
+        ElMessage.error(r.error)
+        return
+      }
+      ElMessage.success(tr('changes.filesRestored'))
+      await refreshAll()
+      notifyMain('restore')
+    })
   }
 
   async function applyChangeDiffLineSelection(
@@ -602,105 +790,164 @@ export function useGitMmChangesWorkspace(repoPath: Ref<string>): ChangesWorkspac
         return
       }
     }
-    let appliedMeta: { addedContextLines: boolean } | null = null
-    let lastApplyErr = ''
-    if (mode === 'discard' && selectedDiffScope.value === 'staged') {
-      strategies: for (const tune of PATCH_APPLY_STRATEGIES) {
-        for (const ctx of LINE_PATCH_CONTEXT_TRY_ORDER) {
-          const ex = extractPartialLinePatchForLineRange(raw, startLine, endLine, ctx)
-          if (!ex) continue
-          const r1 = await at.applyPatch(root, ex.patch, { cached: true, reverse: true, ...tune })
-          if ('error' in r1) {
-            lastApplyErr = r1.error
-            continue
-          }
-          const r2 = await at.applyPatch(root, ex.patch, { cached: false, reverse: true, ...tune })
-          if ('error' in r2) {
-            const rb = await at.applyPatch(root, ex.patch, { cached: true, reverse: false, ...tune })
-            if ('error' in rb) {
-              ElMessage.error(rb.error)
-              await refreshAll()
-              await loadDiff()
-              notifyMain('line-patch')
-              return
+    const busyKey =
+      mode === 'stage' ? 'ws.loadingLineStage' : mode === 'unstage' ? 'ws.loadingLineUnstage' : 'ws.loadingLineDiscard'
+    await runActionBusy(tr(busyKey), async () => {
+      let appliedMeta: { addedContextLines: boolean } | null = null
+      let lastApplyErr = ''
+      if (mode === 'discard' && selectedDiffScope.value === 'staged') {
+        strategies: for (const tune of PATCH_APPLY_STRATEGIES) {
+          for (const ctx of LINE_PATCH_CONTEXT_TRY_ORDER) {
+            const ex = extractPartialLinePatchForLineRange(raw, startLine, endLine, ctx)
+            if (!ex) continue
+            const r1 = await at.applyPatch(root, ex.patch, { cached: true, reverse: true, ...tune })
+            if ('error' in r1) {
+              lastApplyErr = r1.error
+              continue
             }
-            lastApplyErr = r2.error
-            continue
+            const r2 = await at.applyPatch(root, ex.patch, { cached: false, reverse: true, ...tune })
+            if ('error' in r2) {
+              const rb = await at.applyPatch(root, ex.patch, { cached: true, reverse: false, ...tune })
+              if ('error' in rb) {
+                ElMessage.error(rb.error)
+                await refreshAll()
+                await loadDiff()
+                notifyMain('line-patch')
+                return
+              }
+              lastApplyErr = r2.error
+              continue
+            }
+            appliedMeta = { addedContextLines: ex.addedContextLines }
+            break strategies
           }
-          appliedMeta = { addedContextLines: ex.addedContextLines }
-          break strategies
         }
+      } else {
+        const plMode =
+          mode === 'stage' ? 'stage' : mode === 'unstage' ? 'unstage' : 'discard-unstaged'
+        const r = await at.partialLineMerge(root, {
+          relPath: p,
+          diffText: raw,
+          startLine,
+          endLine,
+          mode: plMode
+        })
+        if ('error' in r) {
+          ElMessage.error(r.error)
+          return
+        }
+        appliedMeta = { addedContextLines: r.addedContextLines }
       }
-    } else {
-      const plMode =
-        mode === 'stage' ? 'stage' : mode === 'unstage' ? 'unstage' : 'discard-unstaged'
-      const r = await at.partialLineMerge(root, {
-        relPath: p,
-        diffText: raw,
-        startLine,
-        endLine,
-        mode: plMode
-      })
-      if ('error' in r) {
-        ElMessage.error(r.error)
+      if (!appliedMeta) {
+        ElMessage.error(lastApplyErr || tr('changes.invalidDiffSelection'))
         return
       }
-      appliedMeta = { addedContextLines: r.addedContextLines }
-    }
-    if (!appliedMeta) {
-      ElMessage.error(lastApplyErr || tr('changes.invalidDiffSelection'))
-      return
-    }
-    if (appliedMeta.addedContextLines) {
-      ElMessage.info(tr('changes.diffSelectionContextAdded'))
-    }
-    if (mode === 'discard' && selectedDiffScope.value === 'staged') {
-      ElMessage.success(tr('changes.lineDiscardStagedOk'))
+      if (appliedMeta.addedContextLines) {
+        ElMessage.info(tr('changes.diffSelectionContextAdded'))
+      }
+      if (mode === 'discard' && selectedDiffScope.value === 'staged') {
+        ElMessage.success(tr('changes.lineDiscardStagedOk'))
+        await refreshAll()
+        await loadDiff()
+        notifyMain('line-op')
+        return
+      }
+      const msgKey =
+        mode === 'stage'
+          ? 'changes.lineStageOk'
+          : mode === 'unstage'
+            ? 'changes.lineUnstageOk'
+            : 'changes.lineDiscardOk'
+      ElMessage.success(tr(msgKey))
       await refreshAll()
       await loadDiff()
       notifyMain('line-op')
-      return
-    }
-    const msgKey =
-      mode === 'stage'
-        ? 'changes.lineStageOk'
-        : mode === 'unstage'
-          ? 'changes.lineUnstageOk'
-          : 'changes.lineDiscardOk'
-    ElMessage.success(tr(msgKey))
-    await refreshAll()
-    await loadDiff()
-    notifyMain('line-op')
+    })
   }
 
   async function doCommit() {
-    const subj = commitSubject.value.trim()
-    if (!subj) {
+    const draft = validateCommitDraft()
+    if (!draft) return
+    commitBusy.value = true
+    try {
+      await runActionBusy(tr(draft.wasAmend ? 'ws.loadingCommitAmend' : 'ws.loadingCommit'), async () => {
+        const r = await at.commit(repoPath.value, {
+          subject: draft.subject,
+          body: draft.body,
+          amend: draft.wasAmend
+        })
+        if ('error' in r) {
+          ElMessage.error(r.error)
+          return
+        }
+        resetCommitComposerAfterSuccess()
+        await loadRecentCommitMessages()
+        ElMessage.success(draft.wasAmend ? tr('ws.commitAmended') : tr('ws.commitSucceeded'))
+        await refreshAll()
+        notifyMain('commit')
+      })
+    } finally {
+      commitBusy.value = false
+    }
+  }
+
+  function validateCommitDraft():
+    | { subject: string; body?: string; wasAmend: boolean }
+    | null {
+    const subject = commitSubject.value.trim()
+    if (!subject) {
       ElMessage.warning(tr('ws.commitSubjectRequired'))
-      return
+      return null
     }
     if (!commitAmend.value && stagedRows.value.length === 0) {
       ElMessage.warning(tr('ws.nothingToCommit'))
-      return
+      return null
     }
-    commitBusy.value = true
-    const wasAmend = commitAmend.value
-    const r = await at.commit(repoPath.value, {
-      subject: subj,
+    return {
+      subject,
       body: commitDescription.value.trim() || undefined,
-      amend: wasAmend
-    })
-    commitBusy.value = false
-    if ('error' in r) {
-      ElMessage.error(r.error)
-      return
+      wasAmend: commitAmend.value
     }
+  }
+
+  function resetCommitComposerAfterSuccess() {
+    commitFieldsBeforeAmend.value = null
     commitAmend.value = false
+    amendHeadDetail.value = null
     commitSubject.value = ''
     commitDescription.value = ''
-    ElMessage.success(wasAmend ? tr('ws.commitAmended') : tr('ws.commitSucceeded'))
-    await refreshAll()
-    notifyMain('commit')
+  }
+
+  async function doCommitAndPush() {
+    const draft = validateCommitDraft()
+    if (!draft) return
+    commitBusy.value = true
+    try {
+      await runActionBusy(tr('ws.loadingCommitAndPush'), async () => {
+        const r = await at.commit(repoPath.value, {
+          subject: draft.subject,
+          body: draft.body,
+          amend: draft.wasAmend
+        })
+        if ('error' in r) {
+          ElMessage.error(r.error)
+          return
+        }
+        resetCommitComposerAfterSuccess()
+        const pushResult = await at.push(repoPath.value)
+        await loadRecentCommitMessages()
+        await refreshAll()
+        if ('error' in pushResult) {
+          notifyMain('commit')
+          ElMessage.error(tr('ws.commitSucceededPushFailed', { error: pushResult.error }))
+          return
+        }
+        notifyMain('commit-push')
+        ElMessage.success(draft.wasAmend ? tr('ws.commitAndPushAmended') : tr('ws.commitAndPushSucceeded'))
+      })
+    } finally {
+      commitBusy.value = false
+    }
   }
 
   async function runStashPush(opts: {
@@ -710,61 +957,73 @@ export function useGitMmChangesWorkspace(repoPath: Ref<string>): ChangesWorkspac
     paths?: string[]
   }) {
     const root = repoPath.value
-    let r = await at.stashPush(root, opts)
-    if ('error' in r && isStashNoLocalChangesError(r.error) && !opts.includeUntracked) {
-      r = await at.stashPush(root, { ...opts, includeUntracked: true })
-    }
-    if ('error' in r && isStashNoLocalChangesError(r.error) && opts.paths?.length && !opts.stagedOnly) {
-      r = await at.stashPush(root, { ...opts, stagedOnly: true })
-    }
-    if ('error' in r && isStashNoLocalChangesError(r.error) && opts.paths?.length && opts.stagedOnly) {
-      r = await at.stashPush(root, { stagedOnly: false, paths: undefined, message: opts.message })
-    }
-    if ('error' in r && isStashNoLocalChangesError(r.error) && !opts.stagedOnly && !opts.paths?.length) {
-      r = await at.stashPush(root, { message: opts.message, includeUntracked: opts.includeUntracked, stagedOnly: true })
-    }
-    if ('error' in r) {
-      ElMessage.error(r.error)
-      return
-    }
-    ElMessage.success(tr('changes.stashSaved'))
-    await refreshAll()
-    notifyMain('stash')
+    await runActionBusy(tr('ws.loadingStashSave'), async () => {
+      let r = await at.stashPush(root, opts)
+      if ('error' in r && isStashNoLocalChangesError(r.error) && !opts.includeUntracked) {
+        r = await at.stashPush(root, { ...opts, includeUntracked: true })
+      }
+      if ('error' in r && isStashNoLocalChangesError(r.error) && opts.paths?.length && !opts.stagedOnly) {
+        r = await at.stashPush(root, { ...opts, stagedOnly: true })
+      }
+      if ('error' in r && isStashNoLocalChangesError(r.error) && opts.paths?.length && opts.stagedOnly) {
+        r = await at.stashPush(root, { stagedOnly: false, paths: undefined, message: opts.message })
+      }
+      if ('error' in r && isStashNoLocalChangesError(r.error) && !opts.stagedOnly && !opts.paths?.length) {
+        r = await at.stashPush(root, {
+          message: opts.message,
+          includeUntracked: opts.includeUntracked,
+          stagedOnly: true
+        })
+      }
+      if ('error' in r) {
+        ElMessage.error(r.error)
+        return
+      }
+      ElMessage.success(tr('changes.stashSaved'))
+      await refreshAll()
+      notifyMain('stash')
+    })
   }
 
   async function checkoutConflictOurs(relPath: string) {
     const p = String(relPath ?? '').trim()
     if (!p) return
-    const r = await at.checkoutOurs(repoPath.value, p)
-    if ('error' in r) ElMessage.error(r.error)
-    else {
-      ElMessage.success(tr('ws.checkoutOursDone'))
-      await refreshAll()
-      notifyMain('checkout-ours')
-    }
+    await runActionBusy(tr('ws.loadingCheckoutOurs'), async () => {
+      const r = await at.checkoutOurs(repoPath.value, p)
+      if ('error' in r) ElMessage.error(r.error)
+      else {
+        ElMessage.success(tr('ws.checkoutOursDone'))
+        await refreshAll()
+        notifyMain('checkout-ours')
+      }
+    })
   }
 
   async function checkoutConflictTheirs(relPath: string) {
     const p = String(relPath ?? '').trim()
     if (!p) return
-    const r = await at.checkoutTheirs(repoPath.value, p)
-    if ('error' in r) ElMessage.error(r.error)
-    else {
-      ElMessage.success(tr('ws.checkoutTheirsDone'))
-      await refreshAll()
-      notifyMain('checkout-theirs')
-    }
+    await runActionBusy(tr('ws.loadingCheckoutTheirs'), async () => {
+      const r = await at.checkoutTheirs(repoPath.value, p)
+      if ('error' in r) ElMessage.error(r.error)
+      else {
+        ElMessage.success(tr('ws.checkoutTheirsDone'))
+        await refreshAll()
+        notifyMain('checkout-theirs')
+      }
+    })
   }
 
   async function openMergetoolForPath(relPath?: string) {
     const p = relPath != null ? String(relPath).trim() : ''
-    const r = await at.mergetool(repoPath.value, p || undefined, mergetoolSettingsPayload())
-    if ('error' in r) ElMessage.error(r.error)
-    else {
-      ElMessage.info(tr('ws.mergetoolLaunched'))
-      await refreshAll()
-      notifyMain('mergetool')
-    }
+    await runActionBusy(tr('ws.loadingMergetool'), async () => {
+      const r = await at.mergetool(repoPath.value, p || undefined, mergetoolSettingsPayload())
+      if ('error' in r) ElMessage.error(r.error)
+      else {
+        ElMessage.info(tr('ws.mergetoolLaunched'))
+        await refreshAll()
+        notifyMain('mergetool')
+      }
+    })
   }
 
   async function openBlameDialog(_relPath?: string) {
@@ -791,6 +1050,20 @@ export function useGitMmChangesWorkspace(repoPath: Ref<string>): ChangesWorkspac
   async function refreshAll() {
     await loadStatus()
     await loadDiff()
+  }
+
+  async function loadRecentCommitMessages() {
+    const root = repoPath.value
+    if (!root) {
+      recentCommitMessages.value = []
+      return
+    }
+    const r = await at.log(root, 24)
+    if ('error' in r) {
+      recentCommitMessages.value = []
+      return
+    }
+    recentCommitMessages.value = extractRecentCommitMessages(r.entries, r.gitgraph)
   }
 
   function initDiffOptsFromSettings() {
@@ -833,11 +1106,61 @@ export function useGitMmChangesWorkspace(repoPath: Ref<string>): ChangesWorkspac
     offTheme?.()
   })
 
+  watch(commitAmend, async (on) => {
+    if (!repoPath.value) return
+    if (on) {
+      commitFieldsBeforeAmend.value = {
+        subject: commitSubject.value,
+        description: commitDescription.value
+      }
+      const endBusy = beginActionBusy(tr('ws.loadingAmendPrepare'))
+      try {
+        const seq = ++amendLoadSeq
+        const d = await at.commitDetail(repoPath.value, 'HEAD')
+        if (seq !== amendLoadSeq) return
+        if ('error' in d) {
+          ElMessage.error(d.error)
+          commitFieldsBeforeAmend.value = null
+          commitAmend.value = false
+          return
+        }
+        amendHeadDetail.value = d
+        commitSubject.value = d.subject
+        commitDescription.value = d.body ?? ''
+        if (selectedPath.value) void loadDiff()
+      } finally {
+        endBusy()
+      }
+    } else {
+      amendLoadSeq += 1
+      amendHeadDetail.value = null
+      const bak = commitFieldsBeforeAmend.value
+      commitFieldsBeforeAmend.value = null
+      if (bak) {
+        commitSubject.value = bak.subject
+        commitDescription.value = bak.description
+      }
+      if (selectedPath.value) void loadDiff()
+    }
+  })
+
   watch(
     () => repoPath.value,
     () => {
       selectedPath.value = null
+      commitAmend.value = false
+      amendLoadSeq += 1
+      amendHeadDetail.value = null
+      commitFieldsBeforeAmend.value = null
       void refreshAll()
+    },
+    { immediate: true }
+  )
+
+  watch(
+    () => repoPath.value,
+    () => {
+      void loadRecentCommitMessages()
     },
     { immediate: true }
   )
@@ -888,9 +1211,13 @@ export function useGitMmChangesWorkspace(repoPath: Ref<string>): ChangesWorkspac
     commitDescription,
     commitAmend,
     commitBusy,
+    recentCommitMessages,
+    actionBusy,
+    actionBusyText,
     status,
     statusLoading,
     doCommit,
+    doCommitAndPush,
     checkoutConflictOurs,
     checkoutConflictTheirs,
     openMergetoolForPath,

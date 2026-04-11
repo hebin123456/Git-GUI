@@ -23,8 +23,8 @@ function gitAvailable(): boolean {
 const describeGit = gitAvailable() ? describe : describe.skip
 
 async function configureUser(g: SimpleGit) {
-  await g.addConfig('user.email', 'tester@git-fork-like.test')
-  await g.addConfig('user.name', 'GitForkLike Tester')
+  await g.addConfig('user.email', 'tester@git-gui.test')
+  await g.addConfig('user.name', 'git-gui Tester')
 }
 
 /** 与 UI 文案一致，避免不同 Git 默认分支名（main / master）导致检出失败 */

@@ -1,3 +1,5 @@
+import { getPersistentStorageItem, setPersistentStorageItem } from './persistentStorage.ts'
+
 export const APP_SETTINGS_STORAGE_KEY = 'git-fork-like.app-settings.v1'
 
 /** 主窗口与 Git MM 等子窗口间同步设置（Electron 下 storage 事件不可靠时仍可用） */
@@ -22,6 +24,14 @@ export type PersistedAppSettingsV1 = {
   diffDefaultShowFullFile: boolean
   /** 「所有提交」每次加载的最近提交条数上限（大仓库建议 2000–8000） */
   historyMaxCommits: number
+  /** 当当前仓库无已选远程、当前分支也无 upstream 时，优先使用该远程名作为回退。 */
+  gitDefaultRemoteName: string
+  /** Pull 对话框默认勾选「rebase instead of merge」。 */
+  gitPullRebaseDefault: boolean
+  /** Pull 对话框默认勾选 autostash。 */
+  gitPullAutostashDefault: boolean
+  /** Push 对话框默认勾选 set upstream。 */
+  gitPushSetUpstreamDefault: boolean
   /**
    * 在仓库/子模块目录打开「Git 命令行」时使用的终端可执行文件绝对路径。
    * 留空则使用内置顺序（Windows：Git Bash → Windows Terminal → cmd）。
@@ -46,6 +56,10 @@ export const DEFAULT_APP_SETTINGS: PersistedAppSettingsV1 = {
   diffDefaultIgnoreWhitespace: false,
   diffDefaultShowFullFile: false,
   historyMaxCommits: 4000,
+  gitDefaultRemoteName: '',
+  gitPullRebaseDefault: false,
+  gitPullAutostashDefault: false,
+  gitPushSetUpstreamDefault: true,
   customGitShellPath: '',
   mergeToolPreset: 'default',
   mergeToolExecutablePath: ''
@@ -64,6 +78,13 @@ function clampHistoryMaxCommits(n: unknown): number {
 }
 
 function sanitizeOptionalPath(s: unknown, maxLen: number): string {
+  const t = String(s ?? '').trim()
+  if (!t || t.length > maxLen) return ''
+  if (/[\n\r\x00]/.test(t)) return ''
+  return t
+}
+
+function sanitizeOptionalText(s: unknown, maxLen: number): string {
   const t = String(s ?? '').trim()
   if (!t || t.length > maxLen) return ''
   if (/[\n\r\x00]/.test(t)) return ''
@@ -93,6 +114,13 @@ export function normalizeAppSettings(partial: unknown): PersistedAppSettingsV1 {
     diffDefaultIgnoreWhitespace: !!p.diffDefaultIgnoreWhitespace,
     diffDefaultShowFullFile: !!p.diffDefaultShowFullFile,
     historyMaxCommits: clampHistoryMaxCommits(p.historyMaxCommits),
+    gitDefaultRemoteName: sanitizeOptionalText(p.gitDefaultRemoteName, 120),
+    gitPullRebaseDefault: !!p.gitPullRebaseDefault,
+    gitPullAutostashDefault: !!p.gitPullAutostashDefault,
+    gitPushSetUpstreamDefault:
+      typeof p.gitPushSetUpstreamDefault === 'boolean'
+        ? p.gitPushSetUpstreamDefault
+        : DEFAULT_APP_SETTINGS.gitPushSetUpstreamDefault,
     customGitShellPath: sanitizeOptionalPath(p.customGitShellPath, 500),
     mergeToolPreset: normalizeMergeToolPreset(p.mergeToolPreset),
     mergeToolExecutablePath: sanitizeOptionalPath(p.mergeToolExecutablePath, 500)
@@ -101,7 +129,7 @@ export function normalizeAppSettings(partial: unknown): PersistedAppSettingsV1 {
 
 export function loadAppSettings(): PersistedAppSettingsV1 {
   try {
-    const raw = localStorage.getItem(APP_SETTINGS_STORAGE_KEY)
+    const raw = getPersistentStorageItem(APP_SETTINGS_STORAGE_KEY)
     if (!raw) return { ...DEFAULT_APP_SETTINGS }
     return normalizeAppSettings(JSON.parse(raw))
   } catch {
@@ -123,7 +151,7 @@ function notifyOtherWindowsSettingsSaved(): void {
 
 export function saveAppSettings(data: PersistedAppSettingsV1): void {
   try {
-    localStorage.setItem(APP_SETTINGS_STORAGE_KEY, JSON.stringify(normalizeAppSettings(data)))
+    setPersistentStorageItem(APP_SETTINGS_STORAGE_KEY, JSON.stringify(normalizeAppSettings(data)))
     notifyOtherWindowsSettingsSaved()
   } catch {
     /* quota */

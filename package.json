@@ -1,9 +1,9 @@
 {
-  "name": "git-fork-like",
-  "version": "0.1.0",
-  "description": "Git desktop client (Electron + Vue 3 + TypeScript) — inspired workflow, not a Fork clone",
+  "name": "git-gui",
+  "version": "0.2.0",
+  "description": "git-gui desktop Git client (Electron + Vue 3 + TypeScript)",
   "main": "dist-electron/index.js",
-  "author": "",
+  "author": "hebin",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -38,8 +38,8 @@
     "vue-tsc": "^2.1.10"
   },
   "build": {
-    "appId": "com.example.gitforklike",
-    "productName": "GitForkLike",
+    "appId": "me.hebin.gitgui",
+    "productName": "git-gui",
     "directories": {
       "output": "release",
       "buildResources": "build"

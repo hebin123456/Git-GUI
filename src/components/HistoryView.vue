@@ -1,11 +1,13 @@
 <script setup lang="ts">
+import { ElMessage } from 'element-plus'
 import { ref } from 'vue'
-import { Search, FolderOpened, Plus, Minus, ArrowDown, Document } from '@element-plus/icons-vue'
+import { Search, FolderOpened, Plus, Minus, ArrowDown, Document, Download } from '@element-plus/icons-vue'
 import { useI18n } from 'vue-i18n'
 import { useDiff2HtmlCopyMenu } from '../composables/useDiff2HtmlCopyMenu.ts'
 import { EMPTY_DIFF_SENTINEL } from '../constants/diffSentinel.ts'
 import { useGitWorkspace } from '../composables/useGitWorkspace.ts'
 import HistoryGitgraph from './HistoryGitgraph.vue'
+import ResizableSplit from './common/ResizableSplit.vue'
 
 const { t } = useI18n()
 
@@ -19,6 +21,7 @@ const {
   historyTotalLogLimit,
   loadMoreHistoryCommits,
   currentBranch,
+  repoPath,
   remotes,
   selectedHistoryHash,
   selectHistoryByHash,
@@ -71,6 +74,7 @@ const logSearchPickaxe = ref('')
 const logSearchRegexp = ref(false)
 const logSearchAllMatch = ref(false)
 const logSearchIgnoreCase = ref(false)
+const snapshotTreeExporting = ref(false)
 
 function submitLogSearch() {
   void runHistoryLogSearch({
@@ -135,70 +139,115 @@ function openFileHistorySelectedCommitFile() {
   if (!p) return
   openFileHistoryDialog(workingPathFromCommitPath(p))
 }
+
+function basenamePath(p: string | null): string {
+  const raw = String(p ?? '').replace(/[/\\]+$/, '')
+  if (!raw) return 'repo'
+  const i = Math.max(raw.lastIndexOf('/'), raw.lastIndexOf('\\'))
+  return i >= 0 ? raw.slice(i + 1) || 'repo' : raw
+}
+
+function sanitizeFileStem(name: string): string {
+  const clean = name.replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').trim()
+  return clean || 'repo'
+}
+
+async function exportSnapshotTree() {
+  const hash = selectedHistoryHash.value?.trim() ?? ''
+  if (!hash || !commitFilesTreeData.value.length || snapshotTreeExporting.value) return
+  snapshotTreeExporting.value = true
+  try {
+    const rootName = basenamePath(repoPath.value)
+    const fileName = `${sanitizeFileStem(rootName)}-snapshot-${hash.slice(0, 7)}.zip`
+    const r = await window.gitClient.exportCommitArchive({
+      hash,
+      title: t('history.exportSnapshotTreeSaveTitle'),
+      defaultPath: fileName
+    })
+    if ('error' in r) {
+      ElMessage.error(r.error)
+      return
+    }
+    if (r.ok) ElMessage.success(t('history.exportSnapshotTreeSaved'))
+  } finally {
+    snapshotTreeExporting.value = false
+  }
+}
 </script>
 
 <template>
   <div class="history-view">
-    <div class="history-flow-wrap history-graph-only">
-      <div v-if="displayHistoryGitgraph.length" class="history-graph-toolbar">
-        <span class="history-graph-toolbar-title">{{ t('history.toolbarTitle') }}</span>
-        <span class="history-graph-toolbar-hint">{{ t('history.toolbarHint') }}</span>
-      </div>
-      <div v-if="displayHistoryGitgraph.length" class="history-log-search-bar">
-        <el-input
-          v-model="logSearchGrep"
-          size="small"
-          clearable
-          :placeholder="t('history.grepPlaceholder')"
-          class="history-log-search-input"
-          @keyup.enter="submitLogSearch"
-        />
-        <el-input
-          v-model="logSearchPickaxe"
-          size="small"
-          clearable
-          :placeholder="t('history.pickaxePlaceholder')"
-          class="history-log-search-input"
-          @keyup.enter="submitLogSearch"
-        />
-        <el-checkbox v-model="logSearchIgnoreCase" size="small">{{ t('history.ignoreCase') }}</el-checkbox>
-        <el-checkbox v-model="logSearchRegexp" size="small">{{ t('history.extendedRegexp') }}</el-checkbox>
-        <el-checkbox v-model="logSearchAllMatch" size="small">{{ t('history.allMatch') }}</el-checkbox>
-        <el-button size="small" type="primary" :loading="historySearchLoading" @click="submitLogSearch">
-          {{ t('history.search') }}
-        </el-button>
-        <el-button size="small" :disabled="historySearchLoading" @click="onClearLogSearch">
-          {{ t('history.showAll') }}
-        </el-button>
-      </div>
-      <div
-        v-if="!historySearchActive && displayHistoryGitgraph.length"
-        class="history-log-perf-bar"
-      >
-        <span class="history-log-perf-hint" v-html="t('history.perfHint', { n: historyTotalLogLimit })" />
-        <el-button size="small" type="primary" plain @click="loadMoreHistoryCommits">{{
-          t('history.loadMore')
-        }}</el-button>
-      </div>
-      <div v-if="displayHistoryGitgraph.length" class="history-graph-scrollbar">
-        <HistoryGitgraph
-          :rows="displayHistoryGitgraph"
-          :selected-hash="selectedHistoryHash"
-          :history-active="activeView === 'history'"
-          :current-branch="currentBranch"
-          :remotes="remotes"
-          @select="onGraphSelect"
-          @merge="onGraphMerge"
-          @rebase="onGraphRebase"
-          @cherry-pick="onGraphCherryPick"
-          @revert="onGraphRevert"
-          @reset="onGraphReset"
-        />
-      </div>
-      <el-empty v-else class="history-flow-empty" :description="t('history.emptyCommits')" :image-size="64" />
-    </div>
+    <ResizableSplit
+      class="history-main-split"
+      direction="vertical"
+      storage-key="fork-layout-history-main"
+      :default-primary-percent="46"
+      :min-primary-percent="20"
+      :max-primary-percent="78"
+    >
+      <template #top>
+        <div class="history-flow-wrap history-graph-only">
+          <div v-if="displayHistoryGitgraph.length" class="history-graph-toolbar">
+            <span class="history-graph-toolbar-title">{{ t('history.toolbarTitle') }}</span>
+            <span class="history-graph-toolbar-hint">{{ t('history.toolbarHint') }}</span>
+          </div>
+          <div v-if="displayHistoryGitgraph.length" class="history-log-search-bar">
+            <el-input
+              v-model="logSearchGrep"
+              size="small"
+              clearable
+              :placeholder="t('history.grepPlaceholder')"
+              class="history-log-search-input"
+              @keyup.enter="submitLogSearch"
+            />
+            <el-input
+              v-model="logSearchPickaxe"
+              size="small"
+              clearable
+              :placeholder="t('history.pickaxePlaceholder')"
+              class="history-log-search-input"
+              @keyup.enter="submitLogSearch"
+            />
+            <el-checkbox v-model="logSearchIgnoreCase" size="small">{{ t('history.ignoreCase') }}</el-checkbox>
+            <el-checkbox v-model="logSearchRegexp" size="small">{{ t('history.extendedRegexp') }}</el-checkbox>
+            <el-checkbox v-model="logSearchAllMatch" size="small">{{ t('history.allMatch') }}</el-checkbox>
+            <el-button size="small" type="primary" :loading="historySearchLoading" @click="submitLogSearch">
+              {{ t('history.search') }}
+            </el-button>
+            <el-button size="small" :disabled="historySearchLoading" @click="onClearLogSearch">
+              {{ t('history.showAll') }}
+            </el-button>
+          </div>
+          <div
+            v-if="!historySearchActive && displayHistoryGitgraph.length"
+            class="history-log-perf-bar"
+          >
+            <span class="history-log-perf-hint" v-html="t('history.perfHint', { n: historyTotalLogLimit })" />
+            <el-button size="small" type="primary" plain @click="loadMoreHistoryCommits">{{
+              t('history.loadMore')
+            }}</el-button>
+          </div>
+          <div v-if="displayHistoryGitgraph.length" class="history-graph-scrollbar">
+            <HistoryGitgraph
+              :rows="displayHistoryGitgraph"
+              :selected-hash="selectedHistoryHash"
+              :history-active="activeView === 'history'"
+              :current-branch="currentBranch"
+              :remotes="remotes"
+              @select="onGraphSelect"
+              @merge="onGraphMerge"
+              @rebase="onGraphRebase"
+              @cherry-pick="onGraphCherryPick"
+              @revert="onGraphRevert"
+              @reset="onGraphReset"
+            />
+          </div>
+          <el-empty v-else class="history-flow-empty" :description="t('history.emptyCommits')" :image-size="64" />
+        </div>
+      </template>
 
-    <div class="commit-detail-pane-outer">
+      <template #bottom>
+        <div class="commit-detail-pane-outer">
       <div class="commit-detail-pane">
       <el-tabs v-model="detailTab" class="detail-tabs">
         <el-tab-pane :label="t('history.tabCommit')" name="commit" class="detail-tab-pane-commit">
@@ -342,7 +391,15 @@ function openFileHistorySelectedCommitFile() {
           <div v-else-if="commitDetail && !commitDetail.files.length" class="diff-placeholder">{{
             t('history.noFileChanges')
           }}</div>
-          <div v-else-if="commitDetail && commitDetail.files.length" class="detail-commit-diff-panel detail-commit-diff-split">
+          <ResizableSplit
+            v-else-if="commitDetail && commitDetail.files.length"
+            class="detail-commit-diff-split"
+            storage-key="fork-layout-history-changes"
+            :default-primary-percent="28"
+            :min-primary-percent="14"
+            :max-primary-percent="46"
+          >
+            <template #left>
             <div class="detail-commit-diff-sidebar">
               <el-input
                 v-model="historyChangeFileSearch"
@@ -398,6 +455,8 @@ function openFileHistorySelectedCommitFile() {
                 </div>
               </div>
             </div>
+            </template>
+            <template #right>
             <div class="detail-commit-diff-main">
               <div class="diff-actions detail-commit-diff-actions">
                 <el-button
@@ -523,13 +582,22 @@ function openFileHistorySelectedCommitFile() {
                 </div>
               </div>
             </div>
-          </div>
+            </template>
+          </ResizableSplit>
         </el-tab-pane>
         <el-tab-pane :label="t('history.tabFiles')" name="files" class="detail-tab-pane-fill">
           <div v-if="!selectedHistoryHash" class="detail-tab-empty">{{ t('history.selectCommitInGraph') }}</div>
           <div v-else-if="commitSnapshotTreeLoading" class="diff-placeholder">{{ t('common.loading') }}</div>
           <div v-else-if="!commitFilesTreeData.length" class="diff-placeholder">{{ t('history.snapshotTreeEmpty') }}</div>
-          <div v-else class="detail-commit-diff-panel detail-commit-diff-split">
+          <ResizableSplit
+            v-else
+            class="detail-commit-diff-split"
+            storage-key="fork-layout-history-files"
+            :default-primary-percent="30"
+            :min-primary-percent="14"
+            :max-primary-percent="48"
+          >
+            <template #left>
             <div class="detail-commit-diff-sidebar detail-files-tab-sidebar">
               <el-input
                 v-model="historySnapshotTreeSearch"
@@ -542,6 +610,19 @@ function openFileHistorySelectedCommitFile() {
                   <el-icon><Search /></el-icon>
                 </template>
               </el-input>
+              <div class="detail-files-tab-actions">
+                <el-button
+                  size="small"
+                  class="detail-files-tab-export-btn"
+                  :loading="snapshotTreeExporting"
+                  :disabled="commitSnapshotTreeLoading || !commitFilesTreeData.length"
+                  :title="t('history.exportSnapshotTreeHint')"
+                  @click="exportSnapshotTree"
+                >
+                  <el-icon class="el-icon--left"><Download /></el-icon>
+                  {{ t('history.exportSnapshotTree') }}
+                </el-button>
+              </div>
               <div class="detail-pane-scroll-host">
                 <div class="detail-pane-scroll-inner detail-commit-diff-tree-inner">
                 <el-tree
@@ -589,6 +670,8 @@ function openFileHistorySelectedCommitFile() {
                 </div>
               </div>
             </div>
+            </template>
+            <template #right>
             <div class="detail-commit-diff-main">
               <div class="diff-actions detail-commit-diff-actions">
                 <el-button
@@ -714,11 +797,14 @@ function openFileHistorySelectedCommitFile() {
                 </div>
               </div>
             </div>
-          </div>
+            </template>
+          </ResizableSplit>
         </el-tab-pane>
       </el-tabs>
       </div>
-    </div>
+        </div>
+      </template>
+    </ResizableSplit>
     <Teleport to="body">
       <div
         v-if="diff2htmlCopyMenu.visible"

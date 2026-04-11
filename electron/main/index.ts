@@ -1,5 +1,5 @@
-import { app, BrowserWindow, ipcMain, dialog, Menu, shell } from 'electron'
-import { spawn, type ChildProcess } from 'node:child_process'
+import { app, BrowserWindow, ipcMain, dialog, Menu, shell, session } from 'electron'
+import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import fs from 'node:fs'
@@ -9,6 +9,276 @@ import { mergePartialUsingUnifiedDiff } from '../../src/utils/partialLineMerge.t
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 process.env.DIST = path.join(__dirname, '..', 'dist')
+
+const FIXED_USER_DATA_DIR_NAME = 'git-gui'
+try {
+  app.setPath('userData', path.join(app.getPath('appData'), FIXED_USER_DATA_DIR_NAME))
+} catch {
+  /* ignore */
+}
+
+const MAIN_APP_SETTINGS_STORAGE_KEY = 'git-fork-like.app-settings.v1'
+const MAIN_WORKSPACE_STORAGE_KEY = 'git-fork-like.workspace.v1'
+const GIT_MM_WORKSPACES_STORAGE_KEY = 'gitforklike-mm-workspaces-v1'
+const GIT_MM_START_STORAGE_KEY = 'gitforklike-mm-start-v1'
+const GIT_MM_SYNC_JOBS_STORAGE_KEY = 'gitforklike-mm-sync-jobs-v1'
+const GIT_MM_SUBREPO_ORDER_STORAGE_KEY = 'gitforklike-mm-subrepo-order-v1'
+const PERSISTED_UI_STATE_FILE_NAME = 'persisted-ui-state.json'
+const PERSISTED_UI_STORAGE_KEYS = [
+  MAIN_APP_SETTINGS_STORAGE_KEY,
+  MAIN_WORKSPACE_STORAGE_KEY,
+  GIT_MM_WORKSPACES_STORAGE_KEY,
+  GIT_MM_START_STORAGE_KEY,
+  GIT_MM_SYNC_JOBS_STORAGE_KEY,
+  GIT_MM_SUBREPO_ORDER_STORAGE_KEY
+] as const
+
+type PersistedUiStateStore = {
+  v: 1
+  items: Record<string, string>
+}
+
+let persistedUiStateStoreCache: PersistedUiStateStore | null = null
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value)
+}
+
+function sanitizePersistedUiItems(value: unknown): Record<string, string> {
+  if (!isRecord(value)) return {}
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(value)) {
+    if (!k.trim() || typeof v !== 'string') continue
+    out[k] = v
+  }
+  return out
+}
+
+function getPersistedUiStateFilePath(): string {
+  return path.join(app.getPath('userData'), PERSISTED_UI_STATE_FILE_NAME)
+}
+
+function readPersistedUiStateStoreFile(): PersistedUiStateStore | null {
+  try {
+    const filePath = getPersistedUiStateFilePath()
+    if (!fs.existsSync(filePath)) return null
+    const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8')) as { v?: unknown; items?: unknown }
+    if (parsed?.v !== 1) return null
+    return { v: 1, items: sanitizePersistedUiItems(parsed.items) }
+  } catch {
+    return null
+  }
+}
+
+function writePersistedUiStateStoreFile(store: PersistedUiStateStore): void {
+  try {
+    const filePath = getPersistedUiStateFilePath()
+    fs.mkdirSync(path.dirname(filePath), { recursive: true })
+    fs.writeFileSync(filePath, JSON.stringify(store, null, 2), 'utf8')
+  } catch {
+    /* ignore */
+  }
+}
+
+function listKnownUserDataDirs(): string[] {
+  const appDataPath = app.getPath('appData')
+  const candidates = [
+    app.getPath('userData'),
+    path.join(appDataPath, 'git-fork-like'),
+    path.join(appDataPath, 'GitGUI')
+  ]
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const item of candidates) {
+    const normalized = path.resolve(item)
+    if (seen.has(normalized) || !fs.existsSync(normalized)) continue
+    seen.add(normalized)
+    out.push(normalized)
+  }
+  return out
+}
+
+function findJsonValueStart(text: string, from: number): number {
+  const max = Math.min(text.length, from + 8192)
+  for (let i = Math.max(0, from); i < max; i += 1) {
+    const ch = text[i]
+    if (
+      ch === '{' ||
+      ch === '[' ||
+      ch === '"' ||
+      ch === '-' ||
+      (ch >= '0' && ch <= '9') ||
+      ch === 't' ||
+      ch === 'f' ||
+      ch === 'n'
+    ) {
+      return i
+    }
+  }
+  return -1
+}
+
+function scanJsonStringEnd(text: string, start: number): number {
+  let escaped = false
+  for (let i = start + 1; i < text.length; i += 1) {
+    const ch = text[i]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (ch === '\\') {
+      escaped = true
+      continue
+    }
+    if (ch === '"') return i + 1
+  }
+  return -1
+}
+
+function scanJsonCompoundEnd(text: string, start: number, openCh: '{' | '[', closeCh: '}' | ']'): number {
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i]
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (ch === '\\') {
+        escaped = true
+      } else if (ch === '"') {
+        inString = false
+      }
+      continue
+    }
+    if (ch === '"') {
+      inString = true
+      continue
+    }
+    if (ch === openCh) depth += 1
+    if (ch === closeCh) {
+      depth -= 1
+      if (depth === 0) return i + 1
+    }
+  }
+  return -1
+}
+
+function scanJsonLiteralEnd(text: string, start: number): number {
+  if (text.startsWith('true', start)) return start + 4
+  if (text.startsWith('false', start)) return start + 5
+  if (text.startsWith('null', start)) return start + 4
+  const match = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/.exec(text.slice(start))
+  return match ? start + match[0].length : -1
+}
+
+function extractJsonValueAfterKey(text: string, key: string): string | null {
+  let searchFrom = 0
+  let lastValue: string | null = null
+  while (searchFrom < text.length) {
+    const keyIdx = text.indexOf(key, searchFrom)
+    if (keyIdx === -1) break
+    const start = findJsonValueStart(text, keyIdx + key.length)
+    if (start !== -1) {
+      const startCh = text[start]
+      const end =
+        startCh === '"'
+          ? scanJsonStringEnd(text, start)
+          : startCh === '{'
+            ? scanJsonCompoundEnd(text, start, '{', '}')
+            : startCh === '['
+              ? scanJsonCompoundEnd(text, start, '[', ']')
+              : scanJsonLiteralEnd(text, start)
+      if (end !== -1) {
+        const candidate = text.slice(start, end)
+        try {
+          JSON.parse(candidate)
+          lastValue = candidate
+        } catch {
+          /* ignore malformed fragments */
+        }
+      }
+    }
+    searchFrom = keyIdx + key.length
+  }
+  return lastValue
+}
+
+function readRendererLocalStorageSnapshotFromUserDataDir(userDataDir: string): Partial<Record<string, string>> {
+  const leveldbDir = path.join(userDataDir, 'Local Storage', 'leveldb')
+  if (!fs.existsSync(leveldbDir)) return {}
+  let fileNames: string[] = []
+  try {
+    fileNames = fs
+      .readdirSync(leveldbDir)
+      .filter((name) => /^\d+\.log$/i.test(name))
+      .sort((a, b) => Number(a.replace(/\.log$/i, '')) - Number(b.replace(/\.log$/i, '')))
+  } catch {
+    return {}
+  }
+  const out: Partial<Record<string, string>> = {}
+  for (const name of fileNames) {
+    try {
+      const raw = fs.readFileSync(path.join(leveldbDir, name), 'utf8').replace(/\u0000/g, '')
+      for (const key of PERSISTED_UI_STORAGE_KEYS) {
+        const value = extractJsonValueAfterKey(raw, key)
+        if (value != null) out[key] = value
+      }
+    } catch {
+      /* ignore broken logs */
+    }
+  }
+  return out
+}
+
+function seedPersistedUiStateStoreFromKnownDirs(
+  baseStore: PersistedUiStateStore
+): { store: PersistedUiStateStore; changed: boolean } {
+  const items = { ...baseStore.items }
+  let changed = false
+  for (const userDataDir of listKnownUserDataDirs()) {
+    const extracted = readRendererLocalStorageSnapshotFromUserDataDir(userDataDir)
+    for (const key of PERSISTED_UI_STORAGE_KEYS) {
+      if (items[key] != null) continue
+      const value = extracted[key]
+      if (typeof value !== 'string') continue
+      items[key] = value
+      changed = true
+    }
+  }
+  return changed ? { store: { v: 1, items }, changed: true } : { store: baseStore, changed: false }
+}
+
+function getPersistedUiStateStore(): PersistedUiStateStore {
+  if (persistedUiStateStoreCache) return persistedUiStateStoreCache
+  const initialStore = readPersistedUiStateStoreFile() ?? { v: 1 as const, items: {} }
+  const seeded = seedPersistedUiStateStoreFromKnownDirs(initialStore)
+  persistedUiStateStoreCache = seeded.store
+  if (seeded.changed || initialStore !== seeded.store) {
+    writePersistedUiStateStoreFile(seeded.store)
+  }
+  return persistedUiStateStoreCache
+}
+
+function getPersistedUiStateValue(key: string): string | null {
+  const store = getPersistedUiStateStore()
+  return store.items[key] ?? null
+}
+
+function setPersistedUiStateValue(key: string, value: string): void {
+  if (!key.trim()) return
+  const store = getPersistedUiStateStore()
+  store.items[key] = value
+  writePersistedUiStateStoreFile(store)
+}
+
+function removePersistedUiStateValue(key: string): void {
+  if (!key.trim()) return
+  const store = getPersistedUiStateStore()
+  if (!(key in store.items)) return
+  delete store.items[key]
+  writePersistedUiStateStoreFile(store)
+}
 
 /** 开发态从仓库 `build/icon.png`；打包后从 `extraResources` 的 `icon.png` 读取 */
 function resolveAppIconPath(): string | undefined {
@@ -24,6 +294,160 @@ function resolveAppIconPath(): string | undefined {
 
 /** git-mm:exec-interactive 中 [Y/n] 提示，等待渲染进程回写 y/n */
 const pendingGitMmPromptResolvers = new Map<string, (line: string) => void>()
+type ManagedGitChild = {
+  purpose: string
+  detached: boolean
+  killOnQuit: boolean
+}
+const managedGitChildren = new Map<number, ManagedGitChild>()
+const quitExemptGitPids = new Set<number>()
+let managedGitCleanupStarted = false
+let quitStorageFlushStarted = false
+let quitStorageFlushDone = false
+
+async function flushRendererStorageDataForQuit(): Promise<void> {
+  const sessions = new Set<Electron.Session>()
+  try {
+    sessions.add(session.defaultSession)
+  } catch {
+    /* ignore */
+  }
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (win.isDestroyed()) continue
+    try {
+      sessions.add(win.webContents.session)
+    } catch {
+      /* ignore */
+    }
+  }
+  if (!sessions.size) return
+  await Promise.allSettled([...sessions].map((s) => s.flushStorageData()))
+}
+
+function attachManagedGitChild(child: ChildProcess, purpose: string, detached: boolean, killOnQuit = true): ChildProcess {
+  const bind = () => {
+    const pid = Number(child.pid ?? 0)
+    if (!Number.isFinite(pid) || pid <= 0) return
+    managedGitChildren.set(pid, { purpose, detached, killOnQuit })
+    if (!killOnQuit) quitExemptGitPids.add(pid)
+    const cleanup = () => {
+      managedGitChildren.delete(pid)
+      quitExemptGitPids.delete(pid)
+    }
+    child.once('close', cleanup)
+    child.once('exit', cleanup)
+    child.once('error', cleanup)
+  }
+  if (typeof child.pid === 'number' && child.pid > 0) bind()
+  else child.once('spawn', bind)
+  return child
+}
+
+function spawnTrackedGit(
+  args: string[],
+  options: SpawnOptions,
+  purpose: string,
+  killOnQuit = true
+): ChildProcess {
+  return attachManagedGitChild(spawn('git', args, options), purpose, !!options.detached, killOnQuit)
+}
+
+function listWindowsDescendantGitPids(rootPid: number): number[] {
+  const script = [
+    '$root = [int]$args[0]',
+    '$items = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Select-Object ProcessId, ParentProcessId, Name)',
+    'if (-not $items.Count) { return }',
+    '$children = @{}',
+    '$byId = @{}',
+    'foreach ($item in $items) {',
+    '  $pid = [int]$item.ProcessId',
+    '  $parent = [int]$item.ParentProcessId',
+    '  $byId[$pid] = $item',
+    '  if (-not $children.ContainsKey($parent)) { $children[$parent] = New-Object System.Collections.ArrayList }',
+    '  [void]$children[$parent].Add($pid)',
+    '}',
+    '$seen = New-Object "System.Collections.Generic.HashSet[int]"',
+    '$stack = New-Object System.Collections.Stack',
+    '$stack.Push($root)',
+    'while ($stack.Count -gt 0) {',
+    '  $cur = [int]$stack.Pop()',
+    '  if (-not $children.ContainsKey($cur)) { continue }',
+    '  foreach ($child in $children[$cur]) {',
+    '    $pid = [int]$child',
+    '    if ($seen.Add($pid)) {',
+    '      $stack.Push($pid)',
+    '      $proc = $byId[$pid]',
+    '      if ($proc -and ([string]$proc.Name) -match "^(git|git\\.exe)$") {',
+    '        Write-Output $pid',
+    '      }',
+    '    }',
+    '  }',
+    '}'
+  ].join('; ')
+  try {
+    const res = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script, String(rootPid)], {
+      windowsHide: true,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    })
+    const out = String(res.stdout ?? '').trim()
+    if (!out) return []
+    return [...new Set(out.split(/\r?\n/).map((s) => Number(s.trim())).filter((n) => Number.isFinite(n) && n > 0))]
+  } catch {
+    return []
+  }
+}
+
+function terminateTrackedGitPid(pid: number, detached: boolean) {
+  if (!Number.isFinite(pid) || pid <= 0) return
+  if (process.platform === 'win32') {
+    try {
+      spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], {
+        windowsHide: true,
+        stdio: 'ignore'
+      })
+    } catch {
+      /* ignore */
+    }
+    return
+  }
+  try {
+    if (detached) {
+      try {
+        process.kill(-pid, 'SIGTERM')
+        return
+      } catch {
+        /* ignore */
+      }
+    }
+    process.kill(pid, 'SIGTERM')
+  } catch {
+    /* ignore */
+  }
+}
+
+function cleanupManagedGitChildrenForQuit() {
+  if (managedGitCleanupStarted) return
+  managedGitCleanupStarted = true
+  pendingGitMmPromptResolvers.clear()
+
+  const targets = new Map<number, boolean>()
+  for (const [pid, meta] of managedGitChildren) {
+    if (!meta.killOnQuit) continue
+    targets.set(pid, meta.detached)
+  }
+  if (process.platform === 'win32') {
+    for (const pid of listWindowsDescendantGitPids(process.pid)) {
+      if (quitExemptGitPids.has(pid)) continue
+      targets.set(pid, managedGitChildren.get(pid)?.detached ?? false)
+    }
+  }
+  for (const [pid, detached] of targets) {
+    terminateTrackedGitPid(pid, detached)
+  }
+  managedGitChildren.clear()
+}
+
 ipcMain.on('git-mm:prompt-answer', (_e, raw: unknown) => {
   const o = raw && typeof raw === 'object' ? (raw as { id?: string; line?: string }) : {}
   const id = String(o.id ?? '')
@@ -32,6 +456,24 @@ ipcMain.on('git-mm:prompt-answer', (_e, raw: unknown) => {
   if (!res) return
   pendingGitMmPromptResolvers.delete(id)
   res(line.startsWith('y') ? 'y' : 'n')
+})
+
+ipcMain.on('app-storage:get-sync', (event, rawKey: unknown) => {
+  const key = String(rawKey ?? '').trim()
+  event.returnValue = key ? getPersistedUiStateValue(key) : null
+})
+
+ipcMain.on('app-storage:set-sync', (event, raw: unknown) => {
+  const payload = raw && typeof raw === 'object' ? (raw as { key?: unknown; value?: unknown }) : {}
+  const key = String(payload.key ?? '').trim()
+  if (key) setPersistedUiStateValue(key, String(payload.value ?? ''))
+  event.returnValue = true
+})
+
+ipcMain.on('app-storage:remove-sync', (event, rawKey: unknown) => {
+  const key = String(rawKey ?? '').trim()
+  if (key) removePersistedUiStateValue(key)
+  event.returnValue = true
 })
 
 let mainWindow: BrowserWindow | null = null
@@ -396,11 +838,11 @@ function gitHashObjectWrite(content: string): Promise<{ hash: string } | { error
   const root = repoRoot
   if (!root) return Promise.resolve({ error: '未打开仓库' })
   return new Promise((resolve) => {
-    const child: ChildProcess = spawn('git', ['hash-object', '-w', '--stdin'], {
+    const child: ChildProcess = spawnTrackedGit(['hash-object', '-w', '--stdin'], {
       cwd: root,
       windowsHide: true,
       stdio: 'pipe'
-    })
+    }, 'git hash-object')
     let out = ''
     let errBuf = ''
     child.stdout?.on('data', (d: Buffer) => {
@@ -463,11 +905,11 @@ async function writeIndexCacheInfo(relNorm: string, content: string): Promise<{ 
 
 function gitHashObjectWriteCwd(cwdAbs: string, content: string): Promise<{ hash: string } | { error: string }> {
   return new Promise((resolve) => {
-    const child: ChildProcess = spawn('git', ['hash-object', '-w', '--stdin'], {
+    const child: ChildProcess = spawnTrackedGit(['hash-object', '-w', '--stdin'], {
       cwd: cwdAbs,
       windowsHide: true,
       stdio: 'pipe'
-    })
+    }, 'git hash-object')
     let out = ''
     let errBuf = ''
     child.stdout?.on('data', (d: Buffer) => {
@@ -559,11 +1001,11 @@ function applyPatchStdinCwd(
     if (opts.cached) args.push('--cached')
     if (opts.reverse) args.push('-R')
     args.push('-')
-    const child: ChildProcess = spawn('git', args, {
+    const child: ChildProcess = spawnTrackedGit(args, {
       cwd: cwdAbs,
       windowsHide: true,
       stdio: 'pipe'
-    })
+    }, 'git apply')
     let errBuf = ''
     child.stderr?.on('data', (d: Buffer) => {
       errBuf += d.toString()
@@ -600,11 +1042,11 @@ function applyPatchStdin(
     if (opts.cached) args.push('--cached')
     if (opts.reverse) args.push('-R')
     args.push('-')
-    const child: ChildProcess = spawn('git', args, {
+    const child: ChildProcess = spawnTrackedGit(args, {
       cwd: root,
       windowsHide: true,
       stdio: 'pipe'
-    })
+    }, 'git apply')
     let errBuf = ''
     child.stderr?.on('data', (d: Buffer) => {
       errBuf += d.toString()
@@ -775,6 +1217,95 @@ function clearRepo(): void {
 
 function getRoot(): string | null {
   return repoRoot
+}
+
+const EDITABLE_GIT_CONFIG_KEYS = new Set([
+  'user.name',
+  'user.email',
+  'init.defaultBranch',
+  'core.autocrlf',
+  'pull.rebase',
+  'push.autoSetupRemote',
+  'credential.helper'
+])
+
+function sanitizeEditableGitConfigKey(raw: unknown): string {
+  const key = String(raw ?? '').trim()
+  return EDITABLE_GIT_CONFIG_KEYS.has(key) ? key : ''
+}
+
+function sanitizeEditableGitConfigValue(raw: unknown): string {
+  const value = String(raw ?? '').trim()
+  if (!value || value.length > 500) return ''
+  if (/[\n\r\x00]/.test(value)) return ''
+  return value
+}
+
+function gitForConfigScope(scope: 'global' | 'local'): SimpleGit | { error: string } {
+  if (scope === 'global') {
+    return simpleGit({ config: ['core.quotepath=false'] })
+  }
+  if (!git || !repoRoot) return { error: '未打开仓库' }
+  return git
+}
+
+async function readEditableGitConfigEntries(
+  scope: 'global' | 'local',
+  keysRaw: unknown
+): Promise<{ entries: { key: string; value: string }[] } | { error: string }> {
+  const g = gitForConfigScope(scope)
+  if ('error' in g) return g
+  const scopeArg = scope === 'global' ? '--global' : '--local'
+  const keys = Array.isArray(keysRaw)
+    ? [...new Set(keysRaw.map((k) => sanitizeEditableGitConfigKey(k)).filter(Boolean))]
+    : []
+  const entries: { key: string; value: string }[] = []
+  for (const key of keys) {
+    try {
+      const value = (await g.raw(['config', scopeArg, '--get', key])).trimEnd()
+      if (!value) continue
+      entries.push({ key, value })
+    } catch {
+      /* absent key -> ignore */
+    }
+  }
+  return { entries }
+}
+
+async function writeEditableGitConfigEntries(
+  scope: 'global' | 'local',
+  entriesRaw: unknown
+): Promise<{ ok: true } | { error: string }> {
+  const g = gitForConfigScope(scope)
+  if ('error' in g) return g
+  const scopeArg = scope === 'global' ? '--global' : '--local'
+  const entries = Array.isArray(entriesRaw)
+    ? entriesRaw
+        .map((item) => {
+          const o = item && typeof item === 'object' ? (item as { key?: unknown; value?: unknown }) : {}
+          return {
+            key: sanitizeEditableGitConfigKey(o.key),
+            value: sanitizeEditableGitConfigValue(o.value)
+          }
+        })
+        .filter((item) => !!item.key)
+    : []
+  try {
+    for (const entry of entries) {
+      if (entry.value) {
+        await g.raw(['config', scopeArg, '--replace-all', entry.key, entry.value])
+      } else {
+        try {
+          await g.raw(['config', scopeArg, '--unset-all', entry.key])
+        } catch {
+          /* already unset */
+        }
+      }
+    }
+    return { ok: true as const }
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : String(e) }
+  }
 }
 
 /** 字段分隔（勿用 \\x00：在 Windows 上易被管道/字符串处理吃掉，导致解析不到任何提交） */
@@ -1011,7 +1542,7 @@ function createWindow(): void {
     height: 800,
     minWidth: 900,
     minHeight: 560,
-    title: 'GitForkLike',
+    title: 'git-gui',
     ...(icon ? { icon } : {}),
     frame: false,
     webPreferences: {
@@ -1034,6 +1565,17 @@ const gotLock = app.requestSingleInstanceLock()
 if (!gotLock) {
   app.quit()
 } else {
+  app.on('before-quit', (e) => {
+    cleanupManagedGitChildrenForQuit()
+    if (quitStorageFlushDone || quitStorageFlushStarted) return
+    quitStorageFlushStarted = true
+    e.preventDefault()
+    void flushRendererStorageDataForQuit().finally(() => {
+      quitStorageFlushDone = true
+      app.quit()
+    })
+  })
+
   app.on('second-instance', () => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       if (mainWindow.isMinimized()) mainWindow.restore()
@@ -1057,6 +1599,13 @@ if (!gotLock) {
 
   function browserWindowFromSender(sender: Electron.WebContents): BrowserWindow | null {
     return BrowserWindow.fromWebContents(sender) ?? null
+  }
+
+  function dialogOwnerWindowFromSender(sender: Electron.WebContents): BrowserWindow | null {
+    const senderWindow = browserWindowFromSender(sender)
+    if (senderWindow && !senderWindow.isDestroyed()) return senderWindow
+    if (mainWindow && !mainWindow.isDestroyed()) return mainWindow
+    return null
   }
 
   ipcMain.handle('window:minimize', (e) => {
@@ -1085,6 +1634,7 @@ if (!gotLock) {
       return
     }
     const mmIcon = resolveAppIconPath()
+    /** 不设 parent：与主窗口解耦为两个顶层窗口，避免 Windows 下子窗口最小化/最大化异常；各窗口仍有独立渲染进程 */
     gitMmWindow = new BrowserWindow({
       width: 1220,
       height: 780,
@@ -1093,7 +1643,6 @@ if (!gotLock) {
       title: 'Git MM (Beta)',
       ...(mmIcon ? { icon: mmIcon } : {}),
       frame: false,
-      parent: mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined,
       webPreferences: {
         preload: path.join(__dirname, 'index.mjs'),
         contextIsolation: true,
@@ -1174,7 +1723,7 @@ if (!gotLock) {
 
   ipcMain.handle(
     'git-mm:exec',
-    async (_e, payload: { cwd: string; args: string[] }) => {
+    async (event, payload: { cwd: string; args: string[] }) => {
       const cwd = path.resolve(String(payload?.cwd ?? '').trim())
       if (!fs.existsSync(cwd) || !fs.statSync(cwd).isDirectory()) return { error: '工作目录无效' }
       const args = Array.isArray(payload?.args) ? payload.args.map((a) => String(a)) : []
@@ -1186,15 +1735,29 @@ if (!gotLock) {
         { code: number; stdout: string; stderr: string } | { error: string }
       >((resolve) => {
         try {
-          const proc = spawn('git', ['mm', ...args], {
+          const proc = spawnTrackedGit(['mm', ...args], {
             cwd,
             shell: false,
             windowsHide: true,
+            /** 勿对 stdin 使用 pipe：部分 git mm/脚本会读终端，在隐藏子进程里会一直阻塞且 close 不来 */
+            stdio: ['ignore', 'pipe', 'pipe'],
             // 避免 Git 在隐藏子进程里卡住等终端输入（凭据/确认），表现为 sync「一直没反应」
             env: { ...process.env, GIT_TERMINAL_PROMPT: '0' }
-          })
+          }, 'git mm')
           let stdout = ''
           let stderr = ''
+          let settled = false
+          let exitFallbackTimer: ReturnType<typeof setTimeout> | undefined
+
+          const emitOutput = (stream: 'stdout' | 'stderr', text: string) => {
+            if (!text) return
+            try {
+              event.sender.send('git-mm:output', { stream, text })
+            } catch {
+              /* ignore renderer output subscription failures */
+            }
+          }
+
           const killTimer = setTimeout(() => {
             try {
               proc.kill('SIGTERM')
@@ -1202,21 +1765,52 @@ if (!gotLock) {
               /* ignore */
             }
           }, 900_000)
+
+          const finishOk = (code: number) => {
+            if (settled) return
+            settled = true
+            clearTimeout(killTimer)
+            if (exitFallbackTimer !== undefined) {
+              clearTimeout(exitFallbackTimer)
+              exitFallbackTimer = undefined
+            }
+            resolve({ code, stdout, stderr })
+          }
+
           proc.stdout?.on('data', (d: Buffer) => {
-            stdout += d.toString('utf8')
+            const s = d.toString('utf8')
+            stdout += s
             if (stdout.length > 2_000_000) stdout = stdout.slice(-2_000_000)
+            emitOutput('stdout', s)
           })
           proc.stderr?.on('data', (d: Buffer) => {
-            stderr += d.toString('utf8')
+            const s = d.toString('utf8')
+            stderr += s
             if (stderr.length > 800_000) stderr = stderr.slice(-800_000)
+            emitOutput('stderr', s)
           })
           proc.on('error', (err) => {
+            if (settled) return
+            settled = true
             clearTimeout(killTimer)
+            if (exitFallbackTimer !== undefined) {
+              clearTimeout(exitFallbackTimer)
+              exitFallbackTimer = undefined
+            }
             resolve({ error: err.message })
           })
+          /** Windows 上子进程若继承仍打开的 stdio 句柄，可能长期不触发 close；exit 后短延迟兜底结束 IPC */
+          proc.on('exit', (code) => {
+            if (settled) return
+            const c = code ?? 0
+            exitFallbackTimer = setTimeout(() => finishOk(c), 2500)
+          })
           proc.on('close', (code) => {
-            clearTimeout(killTimer)
-            resolve({ code: code ?? 0, stdout, stderr })
+            if (exitFallbackTimer !== undefined) {
+              clearTimeout(exitFallbackTimer)
+              exitFallbackTimer = undefined
+            }
+            finishOk(code ?? 0)
           })
         } catch (e) {
           resolve({ error: e instanceof Error ? e.message : String(e) })
@@ -1239,13 +1833,13 @@ if (!gotLock) {
         (resolve) => {
           let proc: ChildProcess
           try {
-            proc = spawn('git', ['mm', ...args], {
+            proc = spawnTrackedGit(['mm', ...args], {
               cwd,
               shell: false,
               windowsHide: true,
               stdio: ['pipe', 'pipe', 'pipe'],
               env: { ...process.env }
-            })
+            }, 'git mm')
           } catch (e) {
             resolve({ error: e instanceof Error ? e.message : String(e) })
             return
@@ -1254,8 +1848,48 @@ if (!gotLock) {
           let stderr = ''
           let awaitingPrompt = false
           let skipPromptUntilCombinedLen = 0
+          let settled = false
+          let exitFallbackTimer: ReturnType<typeof setTimeout> | undefined
+          let activePromptId: string | null = null
 
           const getCombined = () => `${stderr}\n${stdout}`
+          const emitOutput = (stream: 'stdout' | 'stderr', text: string) => {
+            if (!text) return
+            try {
+              event.sender.send('git-mm:output', { stream, text })
+            } catch {
+              /* ignore renderer output subscription failures */
+            }
+          }
+          const cleanupPromptState = () => {
+            if (activePromptId) {
+              pendingGitMmPromptResolvers.delete(activePromptId)
+              activePromptId = null
+            }
+            awaitingPrompt = false
+          }
+          const finishOk = (code: number) => {
+            if (settled) return
+            settled = true
+            clearTimeout(killTimer)
+            if (exitFallbackTimer !== undefined) {
+              clearTimeout(exitFallbackTimer)
+              exitFallbackTimer = undefined
+            }
+            cleanupPromptState()
+            resolve({ code, stdout, stderr })
+          }
+          const finishErr = (message: string) => {
+            if (settled) return
+            settled = true
+            clearTimeout(killTimer)
+            if (exitFallbackTimer !== undefined) {
+              clearTimeout(exitFallbackTimer)
+              exitFallbackTimer = undefined
+            }
+            cleanupPromptState()
+            resolve({ error: message })
+          }
 
           const killTimer = setTimeout(() => {
             try {
@@ -1277,6 +1911,7 @@ if (!gotLock) {
 
             awaitingPrompt = true
             const id = randomUUID()
+            activePromptId = id
             const promptText = combined.split('\n').slice(-8).join('\n').trim() || '[Y/n]'
             pendingGitMmPromptResolvers.set(id, (yn: string) => {
               try {
@@ -1287,15 +1922,16 @@ if (!gotLock) {
                 /* ignore */
               }
               skipPromptUntilCombinedLen = getCombined().length
+              activePromptId = null
               awaitingPrompt = false
             })
             try {
               event.sender.send('git-mm:prompt', { id, promptText })
             } catch {
               pendingGitMmPromptResolvers.delete(id)
+              activePromptId = null
               awaitingPrompt = false
-              clearTimeout(killTimer)
-              resolve({ error: '无法显示确认对话框' })
+              finishErr('无法显示确认对话框')
             }
           }
 
@@ -1305,21 +1941,31 @@ if (!gotLock) {
             const s = typeof chunk === 'string' ? chunk : chunk.toString('utf8')
             stdout += s
             if (stdout.length > 2_000_000) stdout = stdout.slice(-2_000_000)
+            emitOutput('stdout', s)
             emitPromptIfNeeded()
           })
           proc.stderr?.on('data', (chunk: string | Buffer) => {
             const s = typeof chunk === 'string' ? chunk : chunk.toString('utf8')
             stderr += s
             if (stderr.length > 800_000) stderr = stderr.slice(-800_000)
+            emitOutput('stderr', s)
             emitPromptIfNeeded()
           })
           proc.on('error', (err) => {
-            clearTimeout(killTimer)
-            resolve({ error: err.message })
+            finishErr(err.message)
+          })
+          /** 与非交互命令一致：Windows 上 stdio 句柄可能拖住 close，exit 后短延迟兜底结束 IPC */
+          proc.on('exit', (code) => {
+            if (settled) return
+            const c = code ?? 0
+            exitFallbackTimer = setTimeout(() => finishOk(c), 2500)
           })
           proc.on('close', (code) => {
-            clearTimeout(killTimer)
-            resolve({ code: code ?? 0, stdout, stderr })
+            if (exitFallbackTimer !== undefined) {
+              clearTimeout(exitFallbackTimer)
+              exitFallbackTimer = undefined
+            }
+            finishOk(code ?? 0)
           })
         }
       )
@@ -1370,13 +2016,42 @@ if (!gotLock) {
     }
   })
 
-  ipcMain.handle('git-at:unstage', async (_e, root: unknown, paths: unknown) => {
+  ipcMain.handle('git-at:unstage', async (_e, root: unknown, paths: unknown, opts?: unknown) => {
     const g = simpleGitForAt(root)
     if ('error' in g) return g
-    const arr = Array.isArray(paths) ? paths.map((p) => String(p)) : []
+    const arr = Array.isArray(paths) ? paths.map((p) => j(String(p))) : []
     if (!arr.length) return { error: '未选择路径' }
+    const o = opts && typeof opts === 'object' ? (opts as { amend?: boolean }) : {}
     try {
-      await g.raw(['restore', '--staged', '--', ...arr.map((p) => j(p))])
+      if (!o.amend) {
+        await g.raw(['restore', '--staged', '--', ...arr])
+        return { ok: true as const }
+      }
+      /** 修订上次提交：与 HEAD 索引一致的路径需回退到父提交树，普通 restore --staged 不生效 */
+      const normal: string[] = []
+      const fromParent: string[] = []
+      for (const p of arr) {
+        const diff = (await g.raw(['diff', '--cached', '--', p])).trim()
+        if (!diff) fromParent.push(p)
+        else normal.push(p)
+      }
+      if (normal.length) {
+        await g.raw(['restore', '--staged', '--', ...normal])
+      }
+      if (fromParent.length) {
+        let hasParent = false
+        try {
+          await g.raw(['rev-parse', '--verify', 'HEAD^'])
+          hasParent = true
+        } catch {
+          hasParent = false
+        }
+        if (hasParent) {
+          await g.raw(['restore', '--staged', '--source=HEAD^', '--', ...fromParent])
+        } else {
+          await g.raw(['rm', '--cached', '-f', '--', ...fromParent])
+        }
+      }
       return { ok: true as const }
     } catch (e) {
       return { error: e instanceof Error ? e.message : String(e) }
@@ -1843,12 +2518,17 @@ if (!gotLock) {
       }
       try {
         const r = await new Promise<{ ok: true } | { error: string }>((resolve) => {
-          const child = spawn('git', gitArgs, {
-            cwd,
-            detached: true,
-            stdio: 'ignore',
-            windowsHide: true
-          })
+          const child = spawnTrackedGit(
+            gitArgs,
+            {
+              cwd,
+              detached: true,
+              stdio: 'ignore',
+              windowsHide: true
+            },
+            'git mergetool',
+            false
+          )
           child.on('error', (err: Error) => resolve({ error: err.message }))
           child.on('spawn', () => {
             child.unref()
@@ -1935,29 +2615,25 @@ if (!gotLock) {
     }
   })
 
-  ipcMain.handle('dialog:open-repo', async () => {
+  ipcMain.handle('dialog:open-repo', async (e) => {
     const opts = { properties: ['openDirectory' as const] }
-    const r =
-      mainWindow && !mainWindow.isDestroyed()
-        ? await dialog.showOpenDialog(mainWindow, opts)
-        : await dialog.showOpenDialog(opts)
+    const owner = dialogOwnerWindowFromSender(e.sender)
+    const r = owner ? await dialog.showOpenDialog(owner, opts) : await dialog.showOpenDialog(opts)
     if (r.canceled || !r.filePaths[0]) return null
     return r.filePaths[0]
   })
 
   /** 选择父目录（克隆时保存新仓库的上一级路径） */
-  ipcMain.handle('dialog:select-directory', async () => {
+  ipcMain.handle('dialog:select-directory', async (e) => {
     const opts = { properties: ['openDirectory' as const] }
-    const r =
-      mainWindow && !mainWindow.isDestroyed()
-        ? await dialog.showOpenDialog(mainWindow, opts)
-        : await dialog.showOpenDialog(opts)
+    const owner = dialogOwnerWindowFromSender(e.sender)
+    const r = owner ? await dialog.showOpenDialog(owner, opts) : await dialog.showOpenDialog(opts)
     if (r.canceled || !r.filePaths[0]) return null
     return r.filePaths[0]
   })
 
   /** 选择可执行文件（终端、合并工具等） */
-  ipcMain.handle('dialog:select-executable', async () => {
+  ipcMain.handle('dialog:select-executable', async (e) => {
     const filters =
       process.platform === 'win32'
         ? [
@@ -1966,13 +2642,63 @@ if (!gotLock) {
           ]
         : [{ name: 'All files', extensions: ['*'] }]
     const opts = { properties: ['openFile' as const], filters }
-    const r =
-      mainWindow && !mainWindow.isDestroyed()
-        ? await dialog.showOpenDialog(mainWindow, opts)
-        : await dialog.showOpenDialog(opts)
+    const owner = dialogOwnerWindowFromSender(e.sender)
+    const r = owner ? await dialog.showOpenDialog(owner, opts) : await dialog.showOpenDialog(opts)
     if (r.canceled || !r.filePaths[0]) return null
     return r.filePaths[0]
   })
+
+  ipcMain.handle('dialog:select-patch-file', async (e, raw?: unknown) => {
+    const o = raw && typeof raw === 'object' ? (raw as { title?: string }) : {}
+    const title = String(o.title ?? '').trim()
+    const opts = {
+      title: title || 'Select patch file',
+      properties: ['openFile' as const],
+      filters: [
+        { name: 'Patch files', extensions: ['patch', 'diff'] },
+        { name: 'Text files', extensions: ['patch', 'diff', 'txt'] },
+        { name: 'All files', extensions: ['*'] }
+      ]
+    }
+    const owner = dialogOwnerWindowFromSender(e.sender)
+    const r = owner ? await dialog.showOpenDialog(owner, opts) : await dialog.showOpenDialog(opts)
+    if (r.canceled || !r.filePaths[0]) return null
+    try {
+      const text = fs.readFileSync(r.filePaths[0], 'utf8').replace(/^\uFEFF/u, '')
+      if (text.length > 2_000_000) return { error: '补丁过大' }
+      return { path: r.filePaths[0], text }
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : String(err) }
+    }
+  })
+
+  ipcMain.handle(
+    'dialog:save-text-file',
+    async (e, raw: { title?: string; defaultPath?: string; text?: string } | unknown) => {
+      const o = raw && typeof raw === 'object' ? (raw as { title?: string; defaultPath?: string; text?: string }) : {}
+      const text = String(o.text ?? '')
+      if (text.length > 20_000_000) return { error: '文本过大，无法导出' }
+      const title = String(o.title ?? '').trim()
+      const defaultPath = String(o.defaultPath ?? '').trim()
+      const opts = {
+        title: title || 'Save text file',
+        defaultPath: defaultPath || undefined,
+        filters: [
+          { name: 'Text files', extensions: ['txt'] },
+          { name: 'All files', extensions: ['*'] }
+        ]
+      }
+      try {
+        const owner = dialogOwnerWindowFromSender(e.sender)
+        const r = owner ? await dialog.showSaveDialog(owner, opts) : await dialog.showSaveDialog(opts)
+        if (r.canceled || !r.filePath) return { ok: false as const, canceled: true as const }
+        fs.writeFileSync(r.filePath, text, 'utf8')
+        return { ok: true as const, path: r.filePath }
+      } catch (err) {
+        return { error: err instanceof Error ? err.message : String(err) }
+      }
+    }
+  )
 
   ipcMain.handle(
     'git:clone',
@@ -2013,6 +2739,16 @@ if (!gotLock) {
     return { ok: true as const }
   })
   ipcMain.handle('git:get-root', async () => getRoot())
+  ipcMain.handle(
+    'git:config-get-many',
+    async (_e, opts?: { scope?: 'global' | 'local'; keys?: string[] }) =>
+      readEditableGitConfigEntries(opts?.scope === 'local' ? 'local' : 'global', opts?.keys ?? [])
+  )
+  ipcMain.handle(
+    'git:config-set-many',
+    async (_e, opts?: { scope?: 'global' | 'local'; entries?: { key: string; value?: string | null }[] }) =>
+      writeEditableGitConfigEntries(opts?.scope === 'local' ? 'local' : 'global', opts?.entries ?? [])
+  )
 
   ipcMain.handle('git:status', async () => {
     if (!git || !repoRoot) return { error: '未打开仓库' }
@@ -3017,6 +3753,52 @@ if (!gotLock) {
     }
   })
 
+  ipcMain.handle(
+    'git:export-commit-archive',
+    async (
+      e,
+      raw: { hash?: string; title?: string; defaultPath?: string } | unknown
+    ) => {
+      if (!git) return { error: '未打开仓库' }
+      const o =
+        raw && typeof raw === 'object'
+          ? (raw as { hash?: string; title?: string; defaultPath?: string })
+          : {}
+      const hash = String(o.hash ?? '').trim()
+      if (!hash) return { error: '提交哈希不能为空' }
+      const title = String(o.title ?? '').trim()
+      const defaultPath = String(o.defaultPath ?? '').trim()
+      try {
+        const full = (await git.raw(['rev-parse', '--verify', hash])).trim()
+        const owner = dialogOwnerWindowFromSender(e.sender)
+        const opts = {
+          title: title || 'Export commit snapshot',
+          defaultPath: defaultPath || undefined,
+          filters: [
+            { name: 'Zip archives', extensions: ['zip'] },
+            { name: 'All files', extensions: ['*'] }
+          ]
+        }
+        const r = owner ? await dialog.showSaveDialog(owner, opts) : await dialog.showSaveDialog(opts)
+        if (r.canceled || !r.filePath) return { ok: false as const, canceled: true as const }
+        const archivePath = path.extname(r.filePath).toLowerCase() === '.zip' ? r.filePath : `${r.filePath}.zip`
+        try {
+          await git.raw(['archive', '--format=zip', '-o', archivePath, full])
+        } catch (err) {
+          try {
+            if (fs.existsSync(archivePath)) fs.unlinkSync(archivePath)
+          } catch {
+            /* ignore cleanup failure */
+          }
+          throw err
+        }
+        return { ok: true as const, path: archivePath }
+      } catch (err) {
+        return { error: err instanceof Error ? err.message : String(err) }
+      }
+    }
+  )
+
   ipcMain.handle('git:commit-diff', async (_e, rev: string, opts: DiffOpts, filePath: string) => {
     if (!git) return { error: '未打开仓库' }
     try {
@@ -3362,12 +4144,17 @@ if (!gotLock) {
     }
     try {
       const r = await new Promise<{ ok: true } | { error: string }>((resolve) => {
-        const child = spawn('git', gitArgs, {
-          cwd,
-          detached: true,
-          stdio: 'ignore',
-          windowsHide: true
-        })
+        const child = spawnTrackedGit(
+          gitArgs,
+          {
+            cwd,
+            detached: true,
+            stdio: 'ignore',
+            windowsHide: true
+          },
+          'git mergetool',
+          false
+        )
         child.on('error', (err: Error) => resolve({ error: err.message }))
         child.on('spawn', () => {
           child.unref()

@@ -67,6 +67,9 @@ const { onMenuCommand, repoPath, syncBusy, stashBusy } = useGitWorkspace()
             </el-dropdown-item>
             <el-dropdown-item command="repo:blame" :disabled="!repoPath">{{ t('menu.repoBlame') }}</el-dropdown-item>
             <el-dropdown-item command="repo:file-history" :disabled="!repoPath">{{ t('menu.repoFileHistory') }}</el-dropdown-item>
+            <el-dropdown-item command="repo:apply-patch" :disabled="!repoPath || !!syncBusy || stashBusy">{{
+              t('menu.repoApplyPatch')
+            }}</el-dropdown-item>
             <el-dropdown-item command="repo:add-partial-hint" :disabled="!repoPath">{{
               t('menu.repoAddPartialHint')
             }}</el-dropdown-item>

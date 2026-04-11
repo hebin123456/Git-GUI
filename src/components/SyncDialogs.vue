@@ -4,6 +4,7 @@ import { computed, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useI18n } from 'vue-i18n'
 import { useGitWorkspace } from '../composables/useGitWorkspace.ts'
+import { loadAppSettings } from '../utils/appSettingsStorage.ts'
 
 const api = window.gitClient
 const { t } = useI18n()
@@ -14,7 +15,7 @@ const {
   pushDialogOpen,
   stashDialogOpen,
   remotes,
-  selectedRemote,
+  preferredRemoteName,
   currentBranch,
   branches,
   unstagedRows,
@@ -54,7 +55,7 @@ watch(
     if (!open) return
     fetchAllRemotes.value = false
     fetchPrune.value = false
-    fetchRemote.value = selectedRemote.value || remotes.value[0] || ''
+    fetchRemote.value = preferredRemoteName.value || remotes.value[0] || ''
   }
 )
 
@@ -100,10 +101,11 @@ watch(
   () => pullDialogOpen.value,
   (open) => {
     if (!open) return
-    pullRemote.value = selectedRemote.value || remotes.value[0] || ''
+    const settings = loadAppSettings()
+    pullRemote.value = preferredRemoteName.value || remotes.value[0] || ''
     pullBranch.value = ''
-    pullRebase.value = false
-    pullAutostash.value = false
+    pullRebase.value = settings.gitPullRebaseDefault
+    pullAutostash.value = settings.gitPullAutostashDefault
     void loadPullBranches().then(() => {
       const cur = currentBranch.value
       if (cur && pullRemoteBranchList.value.includes(cur)) pullBranch.value = cur
@@ -167,11 +169,12 @@ watch(
   () => pushDialogOpen.value,
   (open) => {
     if (!open) return
-    pushRemote.value = selectedRemote.value || remotes.value[0] || ''
+    const settings = loadAppSettings()
+    pushRemote.value = preferredRemoteName.value || remotes.value[0] || ''
     const loc = currentBranch.value || branches.value[0] || ''
     pushLocalBranch.value = loc
     pushToBranch.value = loc
-    pushSetUpstream.value = true
+    pushSetUpstream.value = settings.gitPushSetUpstreamDefault
     pushTags.value = false
     pushForce.value = false
     pushForceWithLease.value = false

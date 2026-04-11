@@ -8,7 +8,7 @@ import { registerForkCreateDialogs, useGitWorkspace } from '../composables/useGi
 const api = window.gitClient
 const { t, locale } = useI18n()
 
-const { currentBranch, remotes, selectedRemote, refreshAll, applyRemoteRenameSelection } =
+const { currentBranch, remotes, preferredRemoteName, refreshAll, applyRemoteRenameSelection } =
   useGitWorkspace()
 
 const forkSvg = {
@@ -52,7 +52,7 @@ const branchStartRef = computed(() => (currentBranch.value?.trim() ? currentBran
 
 const tagAtRef = computed(() => branchStartRef.value)
 
-const pushRemoteName = computed(() => selectedRemote.value.trim() || remotes.value[0] || 'origin')
+const pushRemoteName = computed(() => preferredRemoteName.value || remotes.value[0] || 'origin')
 
 function resetBranchForm() {
   newBranchName.value = ''
