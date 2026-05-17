@@ -287,7 +287,7 @@
       "urlLabel": "Repository URL:",
       "urlPh": "Git repository URL",
       "protoAria": "Protocol",
-      "urlHint": "If the protocol is omitted, it is filled from your choice (HTTPS adds https://; SSH becomes git@host:path).",
+      "urlHint": "If the protocol is omitted, it is filled from your choice (HTTPS adds https://; SSH becomes git(at)host:path).",
       "syncSubmodule": "Sync submodule URLs with parent (option)",
       "testConnection": "Test connection",
       "submitAdd": "Add remote",

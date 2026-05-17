@@ -12,6 +12,7 @@ import SyncDialogs from './components/SyncDialogs.vue'
 import AdvancedGitDialogs from './components/AdvancedGitDialogs.vue'
 import CloneRepoDialog from './components/CloneRepoDialog.vue'
 import TagDeleteDialog from './components/TagDeleteDialog.vue'
+import SidebarCreateDialogs from './components/SidebarCreateDialogs.vue'
 import GitOperationBanner from './components/GitOperationBanner.vue'
 import RepoTabsBar from './components/RepoTabsBar.vue'
 import AppHeader from './components/AppHeader.vue'
@@ -95,6 +96,7 @@ useDismissContextMenusOnOutside()
       <AdvancedGitDialogs />
       <CloneRepoDialog />
       <TagDeleteDialog />
+      <SidebarCreateDialogs />
       <SettingsDialog />
       <StashDetailDialog />
       <RepoTabsBar />

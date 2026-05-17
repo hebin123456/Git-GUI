@@ -2,8 +2,27 @@
 import { computed, ref } from 'vue'
 import { ElMessage } from 'element-plus'
 import { useI18n } from 'vue-i18n'
-import { Connection, FolderOpened, Link, PriceTag, Share } from '@element-plus/icons-vue'
-import { registerForkCreateDialogs, useGitWorkspace } from '../composables/useGitWorkspace.ts'
+import { useGitWorkspace } from '../composables/useGitWorkspace.ts'
+import {
+  branchDialogOpen,
+  checkoutAfterCreate,
+  newBranchName,
+  remoteDialogOpen,
+  remoteEditMode,
+  remoteName,
+  remoteOriginalName,
+  remoteProto,
+  remoteUrlInput,
+  submoduleDialogOpen,
+  submodulePath,
+  submoduleRecursive,
+  submoduleUrl,
+  syncSubmoduleUrl,
+  tagDialogOpen,
+  tagMessage,
+  tagName,
+  tagPush
+} from '../composables/useSidebarCreateDialogs.ts'
 
 const api = window.gitClient
 const { t, locale } = useI18n()
@@ -15,31 +34,13 @@ const forkSvg = {
   d: 'M8 3v6c0 1.1.9 2 2 2h.5c.3 0 .5.2.5.5V19a1 1 0 102 0v-7.5c0-.3.2-.5.5-.5H14a2 2 0 002-2V3h-2v6h-1V3h-2v6h-1V3H8zm10 8a2 2 0 00-2 2v4a2 2 0 104 0v-4a2 2 0 00-2-2z'
 }
 
-const branchDialogOpen = ref(false)
-const newBranchName = ref('')
-const checkoutAfterCreate = ref(true)
 const branchBusy = ref(false)
 
-const remoteDialogOpen = ref(false)
-const remoteEditMode = ref(false)
-const remoteOriginalName = ref('')
-const remoteName = ref('origin')
-const remoteUrlInput = ref('')
-const remoteProto = ref<'https' | 'ssh'>('https')
-const syncSubmoduleUrl = ref(true)
 const remoteBusy = ref(false)
 const remoteTestBusy = ref(false)
 
-const tagDialogOpen = ref(false)
-const tagName = ref('')
-const tagMessage = ref('')
-const tagPush = ref(false)
 const tagBusy = ref(false)
 
-const submoduleDialogOpen = ref(false)
-const submoduleUrl = ref('')
-const submodulePath = ref('')
-const submoduleRecursive = ref(false)
 const submoduleBusy = ref(false)
 
 const branchStartLabel = computed(() => {
@@ -53,94 +54,6 @@ const branchStartRef = computed(() => (currentBranch.value?.trim() ? currentBran
 const tagAtRef = computed(() => branchStartRef.value)
 
 const pushRemoteName = computed(() => preferredRemoteName.value || remotes.value[0] || 'origin')
-
-function resetBranchForm() {
-  newBranchName.value = ''
-  checkoutAfterCreate.value = true
-}
-
-function parseRemoteUrlForForm(url: string): { proto: 'https' | 'ssh'; input: string } {
-  const u = String(url ?? '').trim()
-  if (!u) return { proto: 'https', input: '' }
-  if (/^https?:\/\//i.test(u)) {
-    return { proto: 'https', input: u.replace(/^https?:\/\//i, '') }
-  }
-  if (/^git@/i.test(u)) {
-    return { proto: 'ssh', input: u.replace(/^git@/i, '') }
-  }
-  if (/^ssh:\/\//i.test(u)) {
-    return { proto: 'ssh', input: u.replace(/^ssh:\/\//i, '') }
-  }
-  return { proto: 'https', input: u }
-}
-
-function resetRemoteForm() {
-  remoteEditMode.value = false
-  remoteOriginalName.value = ''
-  remoteName.value = 'origin'
-  remoteUrlInput.value = ''
-  remoteProto.value = 'https'
-  syncSubmoduleUrl.value = true
-}
-
-function resetTagForm() {
-  tagName.value = ''
-  tagMessage.value = ''
-  tagPush.value = false
-}
-
-function resetSubmoduleForm() {
-  submoduleUrl.value = ''
-  submodulePath.value = ''
-  submoduleRecursive.value = false
-}
-
-function openNewBranch() {
-  resetBranchForm()
-  branchDialogOpen.value = true
-}
-
-function openAddRemote() {
-  resetRemoteForm()
-  remoteDialogOpen.value = true
-}
-
-function openEditRemote(rm: { name: string; fetchUrl: string; pushUrl: string }) {
-  remoteEditMode.value = true
-  remoteOriginalName.value = rm.name.trim()
-  remoteName.value = rm.name.trim()
-  const { proto, input } = parseRemoteUrlForForm(rm.fetchUrl || rm.pushUrl || '')
-  remoteProto.value = proto
-  remoteUrlInput.value = input
-  syncSubmoduleUrl.value = true
-  remoteDialogOpen.value = true
-}
-
-function openCreateTag() {
-  resetTagForm()
-  tagDialogOpen.value = true
-}
-
-function openAddSubmodule() {
-  resetSubmoduleForm()
-  submoduleDialogOpen.value = true
-}
-
-defineExpose({
-  openNewBranch,
-  openAddRemote,
-  openEditRemote,
-  openCreateTag,
-  openAddSubmodule
-})
-
-registerForkCreateDialogs({
-  openNewBranch,
-  openAddRemote,
-  openEditRemote,
-  openCreateTag,
-  openAddSubmodule
-})
 
 const canCreateBranch = computed(() => !!newBranchName.value.trim())
 
@@ -289,259 +202,155 @@ async function submitSubmodule() {
 </script>
 
 <template>
-  <!-- 新建分支 -->
-  <el-dialog
-    v-model="branchDialogOpen"
-    width="480px"
-    class="fork-sync-dialog"
-    align-center
-    destroy-on-close
-    :close-on-click-modal="false"
-    append-to-body
-  >
-    <template #header>
-      <div class="fork-sync-dlg-head">
-        <div class="fork-sync-dlg-logo" aria-hidden="true">
-          <svg viewBox="0 0 24 24" class="fork-sync-dlg-fork-svg">
-            <path fill="currentColor" :d="forkSvg.d" />
-          </svg>
+  <Teleport to="body">
+    <div v-if="branchDialogOpen" class="fork-native-modal-overlay" @click.self="branchDialogOpen = false">
+      <form class="fork-native-modal" @submit.prevent="submitBranch">
+        <div class="fork-native-modal-head">
+          <div class="fork-native-modal-logo" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path fill="currentColor" :d="forkSvg.d" /></svg>
+          </div>
+          <div>
+            <h2>{{ t('createDlg.branch.title') }}</h2>
+            <p>{{ t('createDlg.branch.sub') }}</p>
+          </div>
         </div>
-        <div class="fork-sync-dlg-titles">
-          <div class="fork-sync-dlg-title">{{ t('createDlg.branch.title') }}</div>
-          <div class="fork-sync-dlg-sub">{{ t('createDlg.branch.sub') }}</div>
+        <div class="fork-native-modal-body">
+          <div class="fork-native-ref">{{ t('createDlg.branch.createOn') }}: {{ branchStartLabel }}</div>
+          <label class="fork-native-field">
+            <span>{{ t('createDlg.branch.nameLabel') }}</span>
+            <input v-model="newBranchName" type="text" :placeholder="t('createDlg.branch.namePh')" autofocus />
+          </label>
+          <label class="fork-native-check">
+            <input v-model="checkoutAfterCreate" type="checkbox" />
+            <span>{{ t('createDlg.branch.checkoutAfter') }}</span>
+          </label>
         </div>
-      </div>
-    </template>
-    <div class="fork-sync-dlg-body">
-      <div class="fork-sync-at-row">
-        <span class="fork-sync-at-label">{{ t('createDlg.branch.createOn') }}</span>
-        <el-icon class="fork-sync-at-ico"><Share /></el-icon>
-        <span class="fork-sync-at-name">{{ branchStartLabel }}</span>
-      </div>
-      <div class="fork-sync-row">
-        <label class="fork-sync-label">{{ t('createDlg.branch.nameLabel') }}</label>
-        <el-input
-          v-model="newBranchName"
-          class="fork-sync-field"
-          :placeholder="t('createDlg.branch.namePh')"
-          clearable
-          @keyup.enter="submitBranch"
-        >
-          <template #prefix>
-            <el-icon><Share /></el-icon>
-          </template>
-        </el-input>
-      </div>
-      <el-checkbox v-model="checkoutAfterCreate" class="fork-sync-check fork-sync-indent-single">
-        {{ t('createDlg.branch.checkoutAfter') }}
-      </el-checkbox>
+        <div class="fork-native-modal-foot">
+          <button type="submit" class="fork-native-primary" :disabled="!canCreateBranch || branchBusy">
+            {{ branchBusy ? t('dialogs.loading') : t('createDlg.branch.create') }}
+          </button>
+          <button type="button" @click="branchDialogOpen = false">{{ t('common.cancel') }}</button>
+        </div>
+      </form>
     </div>
-    <template #footer>
-      <div class="fork-sync-dlg-footer">
-        <el-button type="primary" :disabled="!canCreateBranch" :loading="branchBusy" @click="submitBranch">
-          {{ t('createDlg.branch.create') }}
-        </el-button>
-        <el-button @click="branchDialogOpen = false">{{ t('common.cancel') }}</el-button>
-      </div>
-    </template>
-  </el-dialog>
+  </Teleport>
 
-  <!-- 添加远程 -->
-  <el-dialog
-    v-model="remoteDialogOpen"
-    width="500px"
-    class="fork-sync-dialog"
-    align-center
-    destroy-on-close
-    :close-on-click-modal="false"
-    append-to-body
-  >
-    <template #header>
-      <div class="fork-sync-dlg-head">
-        <div class="fork-sync-dlg-logo" aria-hidden="true">
-          <svg viewBox="0 0 24 24" class="fork-sync-dlg-fork-svg">
-            <path fill="currentColor" :d="forkSvg.d" />
-          </svg>
+  <Teleport to="body">
+    <div v-if="remoteDialogOpen" class="fork-native-modal-overlay" @click.self="remoteDialogOpen = false">
+      <form class="fork-native-modal fork-native-modal--wide" @submit.prevent="submitRemote">
+        <div class="fork-native-modal-head">
+          <div class="fork-native-modal-logo" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path fill="currentColor" :d="forkSvg.d" /></svg>
+          </div>
+          <div>
+            <h2>{{ remoteDialogTitle }}</h2>
+            <p>{{ remoteDialogSub }}</p>
+          </div>
         </div>
-        <div class="fork-sync-dlg-titles">
-          <div class="fork-sync-dlg-title">{{ remoteDialogTitle }}</div>
-          <div class="fork-sync-dlg-sub">{{ remoteDialogSub }}</div>
+        <div class="fork-native-modal-body">
+          <label class="fork-native-field">
+            <span>{{ t('createDlg.remote.nameLabel') }}</span>
+            <input v-model="remoteName" type="text" placeholder="origin" autofocus />
+          </label>
+          <label class="fork-native-field">
+            <span>{{ t('createDlg.remote.urlLabel') }}</span>
+            <div class="fork-native-inline">
+              <input v-model="remoteUrlInput" type="text" :placeholder="t('createDlg.remote.urlPh')" />
+              <select v-model="remoteProto" :aria-label="t('createDlg.remote.protoAria')">
+                <option value="https">HTTPS</option>
+                <option value="ssh">SSH</option>
+              </select>
+            </div>
+          </label>
+          <div class="fork-native-hint">{{ t('createDlg.remote.urlHint') }}</div>
+          <label class="fork-native-check">
+            <input v-model="syncSubmoduleUrl" type="checkbox" />
+            <span>{{ t('createDlg.remote.syncSubmodule') }}</span>
+          </label>
+          <button type="button" class="fork-native-link" :disabled="!remoteUrlInput.trim() || remoteTestBusy" @click="testRemote">
+            {{ remoteTestBusy ? t('dialogs.loading') : t('createDlg.remote.testConnection') }}
+          </button>
         </div>
-      </div>
-    </template>
-    <div class="fork-sync-dlg-body">
-      <div class="fork-sync-row">
-        <label class="fork-sync-label">{{ t('createDlg.remote.nameLabel') }}</label>
-        <el-input v-model="remoteName" class="fork-sync-field" placeholder="origin" clearable>
-          <template #prefix>
-            <el-icon><Connection /></el-icon>
-          </template>
-        </el-input>
-      </div>
-      <div class="fork-sync-row fork-sync-row-url">
-        <label class="fork-sync-label">{{ t('createDlg.remote.urlLabel') }}</label>
-        <div class="fork-sync-url-combo">
-          <el-input
-            v-model="remoteUrlInput"
-            class="fork-sync-field fork-sync-url-input"
-            :placeholder="t('createDlg.remote.urlPh')"
-            clearable
-          >
-            <template #prefix>
-              <el-icon><Link /></el-icon>
-            </template>
-          </el-input>
-          <el-select v-model="remoteProto" class="fork-sync-proto-select" :aria-label="t('createDlg.remote.protoAria')">
-            <el-option label="HTTPS" value="https" />
-            <el-option label="SSH" value="ssh" />
-          </el-select>
+        <div class="fork-native-modal-foot">
+          <button type="submit" class="fork-native-primary" :disabled="!canAddRemote || remoteBusy">
+            {{ remoteBusy ? t('dialogs.loading') : remoteSubmitLabel }}
+          </button>
+          <button type="button" @click="remoteDialogOpen = false">{{ t('common.cancel') }}</button>
         </div>
-      </div>
-      <div class="fork-sync-hint">
-        {{ t('createDlg.remote.urlHint') }}
-      </div>
-      <el-checkbox v-model="syncSubmoduleUrl" class="fork-sync-check fork-sync-indent-single">
-        {{ t('createDlg.remote.syncSubmodule') }}
-      </el-checkbox>
-      <div class="fork-sync-test-link-wrap">
-        <el-button
-          type="primary"
-          link
-          :loading="remoteTestBusy"
-          :disabled="!remoteUrlInput.trim()"
-          @click="testRemote"
-        >
-          {{ t('createDlg.remote.testConnection') }}
-        </el-button>
-      </div>
+      </form>
     </div>
-    <template #footer>
-      <div class="fork-sync-dlg-footer">
-        <el-button type="primary" :disabled="!canAddRemote" :loading="remoteBusy" @click="submitRemote">
-          {{ remoteSubmitLabel }}
-        </el-button>
-        <el-button @click="remoteDialogOpen = false">{{ t('common.cancel') }}</el-button>
-      </div>
-    </template>
-  </el-dialog>
+  </Teleport>
 
-  <!-- 创建标签 -->
-  <el-dialog
-    v-model="tagDialogOpen"
-    width="480px"
-    class="fork-sync-dialog"
-    align-center
-    destroy-on-close
-    :close-on-click-modal="false"
-    append-to-body
-  >
-    <template #header>
-      <div class="fork-sync-dlg-head">
-        <div class="fork-sync-dlg-logo" aria-hidden="true">
-          <svg viewBox="0 0 24 24" class="fork-sync-dlg-fork-svg">
-            <path fill="currentColor" :d="forkSvg.d" />
-          </svg>
+  <Teleport to="body">
+    <div v-if="tagDialogOpen" class="fork-native-modal-overlay" @click.self="tagDialogOpen = false">
+      <form class="fork-native-modal" @submit.prevent="submitTag">
+        <div class="fork-native-modal-head">
+          <div class="fork-native-modal-logo" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path fill="currentColor" :d="forkSvg.d" /></svg>
+          </div>
+          <div>
+            <h2>{{ t('createDlg.tag.title') }}</h2>
+            <p>{{ t('createDlg.tag.sub') }}</p>
+          </div>
         </div>
-        <div class="fork-sync-dlg-titles">
-          <div class="fork-sync-dlg-title">{{ t('createDlg.tag.title') }}</div>
-          <div class="fork-sync-dlg-sub">{{ t('createDlg.tag.sub') }}</div>
+        <div class="fork-native-modal-body">
+          <div class="fork-native-ref">{{ t('createDlg.tag.at') }}: {{ branchStartLabel }}</div>
+          <label class="fork-native-field">
+            <span>{{ t('createDlg.tag.nameLabel') }}</span>
+            <input v-model="tagName" type="text" :placeholder="t('createDlg.tag.namePh')" autofocus />
+          </label>
+          <label class="fork-native-field">
+            <span>{{ t('createDlg.tag.messageLabel') }}</span>
+            <textarea v-model="tagMessage" rows="3" :placeholder="t('createDlg.tag.messagePh')" />
+          </label>
+          <label class="fork-native-check">
+            <input v-model="tagPush" type="checkbox" />
+            <span>{{ t('createDlg.tag.pushTo', { remote: pushRemoteName }) }}</span>
+          </label>
         </div>
-      </div>
-    </template>
-    <div class="fork-sync-dlg-body">
-      <div class="fork-sync-at-row">
-        <span class="fork-sync-at-label">{{ t('createDlg.tag.at') }}</span>
-        <el-icon class="fork-sync-at-ico"><Share /></el-icon>
-        <span class="fork-sync-at-name">{{ branchStartLabel }}</span>
-      </div>
-      <div class="fork-sync-row">
-        <label class="fork-sync-label">{{ t('createDlg.tag.nameLabel') }}</label>
-        <el-input v-model="tagName" class="fork-sync-field" :placeholder="t('createDlg.tag.namePh')" clearable>
-          <template #prefix>
-            <el-icon><PriceTag /></el-icon>
-          </template>
-        </el-input>
-      </div>
-      <div class="fork-sync-row fork-sync-row-msg">
-        <label class="fork-sync-label">{{ t('createDlg.tag.messageLabel') }}</label>
-        <el-input
-          v-model="tagMessage"
-          type="textarea"
-          :rows="3"
-          class="fork-sync-field"
-          :placeholder="t('createDlg.tag.messagePh')"
-        />
-      </div>
-      <el-checkbox v-model="tagPush" class="fork-sync-check fork-sync-indent-single">
-        {{ t('createDlg.tag.pushTo', { remote: pushRemoteName }) }}
-      </el-checkbox>
+        <div class="fork-native-modal-foot">
+          <button type="submit" class="fork-native-primary" :disabled="!canCreateTag || tagBusy">
+            {{ tagBusy ? t('dialogs.loading') : t('createDlg.tag.create') }}
+          </button>
+          <button type="button" @click="tagDialogOpen = false">{{ t('common.cancel') }}</button>
+        </div>
+      </form>
     </div>
-    <template #footer>
-      <div class="fork-sync-dlg-footer">
-        <el-button type="primary" :disabled="!canCreateTag" :loading="tagBusy" @click="submitTag">
-          {{ t('createDlg.tag.create') }}
-        </el-button>
-        <el-button @click="tagDialogOpen = false">{{ t('common.cancel') }}</el-button>
-      </div>
-    </template>
-  </el-dialog>
+  </Teleport>
 
-  <!-- 添加子模块 -->
-  <el-dialog
-    v-model="submoduleDialogOpen"
-    width="500px"
-    class="fork-sync-dialog"
-    align-center
-    destroy-on-close
-    :close-on-click-modal="false"
-    append-to-body
-  >
-    <template #header>
-      <div class="fork-sync-dlg-head">
-        <div class="fork-sync-dlg-logo" aria-hidden="true">
-          <svg viewBox="0 0 24 24" class="fork-sync-dlg-fork-svg">
-            <path fill="currentColor" :d="forkSvg.d" />
-          </svg>
+  <Teleport to="body">
+    <div v-if="submoduleDialogOpen" class="fork-native-modal-overlay" @click.self="submoduleDialogOpen = false">
+      <form class="fork-native-modal fork-native-modal--wide" @submit.prevent="submitSubmodule">
+        <div class="fork-native-modal-head">
+          <div class="fork-native-modal-logo" aria-hidden="true">
+            <svg viewBox="0 0 24 24"><path fill="currentColor" :d="forkSvg.d" /></svg>
+          </div>
+          <div>
+            <h2>{{ t('createDlg.submodule.title') }}</h2>
+            <p>{{ t('createDlg.submodule.sub') }}</p>
+          </div>
         </div>
-        <div class="fork-sync-dlg-titles">
-          <div class="fork-sync-dlg-title">{{ t('createDlg.submodule.title') }}</div>
-          <div class="fork-sync-dlg-sub">{{ t('createDlg.submodule.sub') }}</div>
+        <div class="fork-native-modal-body">
+          <label class="fork-native-field">
+            <span>{{ t('createDlg.submodule.urlLabel') }}</span>
+            <input v-model="submoduleUrl" type="text" :placeholder="t('createDlg.submodule.urlPh')" autofocus />
+          </label>
+          <label class="fork-native-field">
+            <span>{{ t('createDlg.submodule.pathLabel') }}</span>
+            <input v-model="submodulePath" type="text" :placeholder="t('createDlg.submodule.pathPh')" />
+          </label>
+          <label class="fork-native-check">
+            <input v-model="submoduleRecursive" type="checkbox" />
+            <span>{{ t('createDlg.submodule.recursive') }}</span>
+          </label>
         </div>
-      </div>
-    </template>
-    <div class="fork-sync-dlg-body">
-      <div class="fork-sync-row">
-        <label class="fork-sync-label">{{ t('createDlg.submodule.urlLabel') }}</label>
-        <el-input v-model="submoduleUrl" class="fork-sync-field" :placeholder="t('createDlg.submodule.urlPh')" clearable>
-          <template #prefix>
-            <el-icon><Link /></el-icon>
-          </template>
-        </el-input>
-      </div>
-      <div class="fork-sync-row">
-        <label class="fork-sync-label">{{ t('createDlg.submodule.pathLabel') }}</label>
-        <el-input v-model="submodulePath" class="fork-sync-field" :placeholder="t('createDlg.submodule.pathPh')" clearable>
-          <template #prefix>
-            <el-icon><FolderOpened /></el-icon>
-          </template>
-        </el-input>
-      </div>
-      <el-checkbox v-model="submoduleRecursive" class="fork-sync-check fork-sync-indent-single">
-        {{ t('createDlg.submodule.recursive') }}
-      </el-checkbox>
+        <div class="fork-native-modal-foot">
+          <button type="submit" class="fork-native-primary" :disabled="!canAddSubmodule || submoduleBusy">
+            {{ submoduleBusy ? t('dialogs.loading') : t('createDlg.submodule.addBtn') }}
+          </button>
+          <button type="button" @click="submoduleDialogOpen = false">{{ t('common.cancel') }}</button>
+        </div>
+      </form>
     </div>
-    <template #footer>
-      <div class="fork-sync-dlg-footer">
-        <el-button
-          type="primary"
-          :disabled="!canAddSubmodule"
-          :loading="submoduleBusy"
-          @click="submitSubmodule"
-        >
-          {{ t('createDlg.submodule.addBtn') }}
-        </el-button>
-        <el-button @click="submoduleDialogOpen = false">{{ t('common.cancel') }}</el-button>
-      </div>
-    </template>
-  </el-dialog>
+  </Teleport>
 </template>
