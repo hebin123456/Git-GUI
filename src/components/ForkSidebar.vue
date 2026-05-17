@@ -4,8 +4,14 @@ import { ArrowRight, CaretRight, EditPen, Clock, Search, Check, MoreFilled } fro
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { DropdownInstance } from 'element-plus'
 import { useI18n } from 'vue-i18n'
-import { forkCreateDialogFns, useGitWorkspace } from '../composables/useGitWorkspace.ts'
-import SidebarCreateDialogs from './SidebarCreateDialogs.vue'
+import { useGitWorkspace } from '../composables/useGitWorkspace.ts'
+import {
+  openAddRemote,
+  openAddSubmodule,
+  openCreateTag,
+  openEditRemote,
+  openNewBranch
+} from '../composables/useSidebarCreateDialogs.ts'
 
 const { t } = useI18n()
 
@@ -234,21 +240,9 @@ async function onRepoHeadCommand(cmd: string | number) {
   }
 }
 
-function onLocalBranchHeadCommand(cmd: string | number) {
-  if (String(cmd) === 'new') forkCreateDialogFns.openNewBranch()
-}
-
-function onRemoteHeadCommand(cmd: string | number) {
-  if (String(cmd) === 'new') forkCreateDialogFns.openAddRemote()
-}
-
-function onTagHeadCommand(cmd: string | number) {
-  if (String(cmd) === 'new') forkCreateDialogFns.openCreateTag()
-}
-
 function onSubmoduleHeadCommand(cmd: string | number) {
   const c = String(cmd)
-  if (c === 'new') forkCreateDialogFns.openAddSubmodule()
+  if (c === 'new') openAddSubmodule()
   else if (c === 'update') void runSubmoduleUpdateSync()
   else if (c === 'sync') void runSubmoduleSync()
   else if (c === 'update-remote-merge') void runSubmoduleUpdateRemote({ rebase: false })
@@ -353,7 +347,6 @@ async function confirmDeleteBranch(name: string) {
 </script>
 
 <template>
-  <SidebarCreateDialogs />
   <el-aside class="fork-sidebar">
     <div class="sidebar-repo-row">
       <span class="sidebar-repo-name" :title="repoPath ?? undefined">{{ repoTitle }}</span>
@@ -416,20 +409,17 @@ async function confirmDeleteBranch(name: string) {
           >
             <el-icon :size="12"><CaretRight /></el-icon>
           </button>
-          <el-dropdown
-            trigger="contextmenu"
-            class="sidebar-section-head-dropdown"
-            @command="onLocalBranchHeadCommand"
+          <span class="sidebar-section-title" :title="t('sidebar.sectionBranches')">
+            {{ t('sidebar.sectionBranches') }}
+          </span>
+          <button
+            type="button"
+            class="sidebar-section-action-btn"
+            :title="t('sidebar.newBranch')"
+            @click.stop="openNewBranch()"
           >
-            <span class="sidebar-section-title sidebar-section-title--ctx" :title="t('sidebar.ctxMenuTitle')">
-              {{ t('sidebar.sectionBranches') }}
-            </span>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item command="new">{{ t('sidebar.newBranch') }}</el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
+            +
+          </button>
         </div>
         <div v-show="sectionOpen.branches" class="sidebar-collapsible-body">
           <div class="branch-list">
@@ -586,20 +576,17 @@ async function confirmDeleteBranch(name: string) {
           >
             <el-icon :size="12"><CaretRight /></el-icon>
           </button>
-          <el-dropdown
-            trigger="contextmenu"
-            class="sidebar-section-head-dropdown"
-            @command="onRemoteHeadCommand"
+          <span class="sidebar-section-title" :title="t('sidebar.sectionRemotes')">
+            {{ t('sidebar.sectionRemotes') }}
+          </span>
+          <button
+            type="button"
+            class="sidebar-section-action-btn"
+            :title="t('sidebar.addRemote')"
+            @click.stop="openAddRemote()"
           >
-            <span class="sidebar-section-title sidebar-section-title--ctx" :title="t('sidebar.ctxMenuTitle')">
-              {{ t('sidebar.sectionRemotes') }}
-            </span>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item command="new">{{ t('sidebar.addRemote') }}</el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
+            +
+          </button>
         </div>
         <div v-show="sectionOpen.remotes" class="sidebar-collapsible-body">
           <div class="remote-list">
@@ -629,7 +616,7 @@ async function confirmDeleteBranch(name: string) {
                   <template #dropdown>
                     <el-dropdown-menu>
                       <el-dropdown-item @click.stop="fetchRemoteForSidebar(rm.name)">{{ t('sidebar.fetch') }}</el-dropdown-item>
-                      <el-dropdown-item @click.stop="forkCreateDialogFns.openEditRemote(rm)">{{ t('sidebar.edit') }}</el-dropdown-item>
+                      <el-dropdown-item @click.stop="openEditRemote(rm)">{{ t('sidebar.edit') }}</el-dropdown-item>
                       <el-dropdown-item @click.stop="removeRemoteFromSidebar(rm.name)">{{ t('sidebar.delete') }}</el-dropdown-item>
                       <el-dropdown-item divided @click.stop="copyRemoteFetchUrl(rm)">{{ t('sidebar.copyUrl') }}</el-dropdown-item>
                     </el-dropdown-menu>
@@ -714,20 +701,17 @@ async function confirmDeleteBranch(name: string) {
           >
             <el-icon :size="12"><CaretRight /></el-icon>
           </button>
-          <el-dropdown
-            trigger="contextmenu"
-            class="sidebar-section-head-dropdown"
-            @command="onTagHeadCommand"
+          <span class="sidebar-section-title" :title="t('sidebar.sectionTags')">
+            {{ t('sidebar.sectionTags') }}
+          </span>
+          <button
+            type="button"
+            class="sidebar-section-action-btn"
+            :title="t('sidebar.createTag')"
+            @click.stop="openCreateTag()"
           >
-            <span class="sidebar-section-title sidebar-section-title--ctx" :title="t('sidebar.ctxMenuTitle')">
-              {{ t('sidebar.sectionTags') }}
-            </span>
-            <template #dropdown>
-              <el-dropdown-menu>
-                <el-dropdown-item command="new">{{ t('sidebar.createTag') }}</el-dropdown-item>
-              </el-dropdown-menu>
-            </template>
-          </el-dropdown>
+            +
+          </button>
         </div>
         <div v-show="sectionOpen.tags" class="sidebar-collapsible-body">
           <div class="sidebar-tag-list">
@@ -853,6 +837,15 @@ async function confirmDeleteBranch(name: string) {
               </el-dropdown-menu>
             </template>
           </el-dropdown>
+          <button
+            type="button"
+            class="sidebar-section-action-btn"
+            :title="t('sidebar.addSubmodule')"
+            @click.stop="openAddSubmodule()"
+            @contextmenu.stop
+          >
+            +
+          </button>
         </div>
         <div v-show="sectionOpen.submodules" class="sidebar-collapsible-body">
           <div class="sidebar-submodule-list">

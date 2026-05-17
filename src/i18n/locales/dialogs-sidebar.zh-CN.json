@@ -287,7 +287,7 @@
       "urlLabel": "仓库 URL：",
       "urlPh": "Git 仓库 URL",
       "protoAria": "协议",
-      "urlHint": "未写协议时，将按所选协议自动补全（HTTPS 加 https://，SSH 按 host/路径 转为 git@host:路径）。",
+      "urlHint": "未写协议时，将按所选协议自动补全（HTTPS 加 https://，SSH 按 host/路径 转为 git(at)host:路径）。",
       "syncSubmodule": "同步子模块 URL 与父仓库",
       "testConnection": "测试连接",
       "submitAdd": "添加新远程",

@@ -1,6 +1,6 @@
 {
   "name": "git-gui",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "git-gui desktop Git client (Electron + Vue 3 + TypeScript)",
   "main": "dist-electron/index.js",
   "author": "hebin",

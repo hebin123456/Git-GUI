@@ -1553,6 +1553,12 @@ function createWindow(): void {
     backgroundColor: '#ececec'
   })
   const viteUrl = process.env.VITE_DEV_SERVER_URL
+  mainWindow.webContents.on('console-message', (_event, level, message, line, sourceId) => {
+    console.log(`[renderer:${level}] ${message} (${sourceId}:${line})`)
+  })
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    console.error('[renderer:gone]', details)
+  })
   if (viteUrl) {
     mainWindow.loadURL(viteUrl)
     mainWindow.webContents.openDevTools({ mode: 'detach' })
